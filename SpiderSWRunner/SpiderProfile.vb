@@ -50,6 +50,19 @@ Imports System.Text
         Public Direction As Integer ' SW arc direction: -1=CW, +1=CCW
     End Structure
 
+    ''' <summary>
+    ''' Per-roll realized geometry for the FEA calibration matrix.
+    ''' Returned by ComputeRollMetrics(). All arrays are length N.
+    ''' Class (not Structure) to avoid VS2010 value-type return quirks.
+    ''' </summary>
+    Public Class RollMetrics
+        Public RollStart() As Double    ' start radius of each roll (mm)
+        Public Pitch() As Double        ' pitch of each roll (mm)
+        Public H_eff_roll() As Double   ' effective half-height of each roll (mm)
+        Public H_natural() As Double    ' natural half-height (ArcLines/SineLines only, mm)
+        Public RollCount As Integer     ' = N
+    End Class
+
     Public Class SpiderProfile
 
         ' ── Mode ──
@@ -91,7 +104,7 @@ Imports System.Text
         ' User inputs:
         '   BulletR_Top = R2, radius of center top arc (Arc 2)
         '   BulletCx    = Cx, horizontal distance from ID vertical line to Arc 2 center
-        ' Constraints: width/3 ≤ Cx ≤ 2·width/3 where width = (OD - ID)/2 in Edge mode.
+        ' Constraints: width/3 <= Cx <= 2*width/3 where width = (OD - ID)/2 in Edge mode.
         ' Arcs 1 and 3 are tangent arcs drawn by SW's solver.
         Public BulletR_Top As Double = 3.0
         Public BulletCx As Double = 0.0
@@ -101,6 +114,25 @@ Imports System.Text
         Public Nu As Double = 0.49
         Public Density As Double = 1000.0
         Public MaterialName As String = "Rubber"
+
+        ' ── FEA Calibration Campaign: Taper & Variable Pitch ──
+        ' TaperPct: 0 = uniform, 100 = inner roll at 10% floor.
+        '   taper_frac = clamp(TaperPct/100, 0, 1)
+        '   hScale_inner = max(0.10, 1 - taper_frac)
+        '   Per-roll: hScale_n = hScale_inner + (1 - hScale_inner) * t_n, t_n = n/(N-1)
+        '   H_eff_n = H_eff * hScale_n
+        ' VariablePitch / PitchTaperPct: linearly varies pitch from inner to outer.
+        '   Positive PitchTaperPct -> inner wider, outer narrower.
+        '   Pitches are normalized to sum to W_corr exactly.
+        ' UseNaturalH: when True, ArcLines/SineLines use H_n_natural derived from
+        '   pitch_n and ConnectorAngle instead of H_eff_n. The hScale vertical
+        '   stretching is bypassed, preserving the true arc geometry and tangent angles.
+        '   Ignored for Sinusoidal (where H is always a free parameter).
+        '   Required for FEA calibration runs on ArcLines/SineLines profiles.
+        Public TaperPct As Double = 0.0
+        Public VariablePitch As Boolean = False
+        Public PitchTaperPct As Double = 0.0
+        Public UseNaturalH As Boolean = False
 
         ' ── Computed geometry ──
         Public ReadOnly Property R_inner As Double
@@ -174,6 +206,184 @@ Imports System.Text
                 Return H_eff / p
             End Get
         End Property
+
+        ' ══════════════════════════════════════════════════════════════
+        ' Per-roll geometry computation (FEA calibration campaign)
+        ' Implements handoff §4.4 (taper) and §4.5 (variable pitch)
+        ' ══════════════════════════════════════════════════════════════
+
+        ''' <summary>
+        ''' Compute natural half-height for ArcLines at a given pitch and angle.
+        ''' This is the geometric height determined solely by connector angle + pitch.
+        ''' Matches handoff §4.7.
+        ''' </summary>
+        Public Shared Function ComputeNaturalH_ArcLines(ByVal pitch As Double, _
+                ByVal angleDeg As Double, ByVal straightLen As Double) As Double
+            Dim PI As Double = Math.PI
+            Dim theta As Double = Math.Max(0.1, Math.Min(89.9, angleDeg)) * PI / 180.0
+            Dim sth As Double = Math.Sin(theta)
+            Dim cth As Double = Math.Cos(theta)
+            Dim s As Double = Math.Max(0.0, Math.Min(straightLen, pitch * 0.48))
+            Dim r_j As Double = (s / 2.0) * cth
+            Dim z_j As Double = (s / 2.0) * sth
+            Dim wa As Double = pitch - 2.0 * r_j
+            If wa <= 0.001 Then Return z_j
+            Dim a As Double = wa / 2.0
+            Return z_j + a * (1.0 - cth) / Math.Max(sth, 0.001)
+        End Function
+
+        ''' <summary>
+        ''' Compute natural half-height for SineLines at a given pitch and angle.
+        ''' </summary>
+        Public Shared Function ComputeNaturalH_SineLines(ByVal pitch As Double, _
+                ByVal angleDeg As Double, ByVal straightLen As Double) As Double
+            Dim PI As Double = Math.PI
+            Dim theta As Double = Math.Max(0.1, Math.Min(89.9, angleDeg)) * PI / 180.0
+            Dim sth As Double = Math.Sin(theta)
+            Dim cth As Double = Math.Cos(theta)
+            Dim s As Double = Math.Max(0.0, Math.Min(straightLen, pitch * 0.48))
+            Dim r_j As Double = (s / 2.0) * cth
+            Dim z_j As Double = (s / 2.0) * sth
+            Dim wa As Double = pitch - 2.0 * r_j
+            If wa <= 0.001 Then Return z_j
+            Dim amp As Double = Math.Tan(theta) * wa / PI
+            Return z_j + amp
+        End Function
+
+        ''' <summary>
+        ''' Compute per-roll geometry arrays: start radii, pitches, and half-heights.
+        ''' Implements handoff §4.4 (taper with 10% floor) and §4.5 (variable pitch).
+        '''
+        ''' When TaperPct=0 and VariablePitch=False and UseNaturalH=False:
+        '''   All Pitch(n) = EffPitch, all H_eff_roll(n) = H_eff — identical to legacy.
+        '''
+        ''' When UseNaturalH=True and ProfileType is ArcLines(2) or SineLines(3):
+        '''   H_eff_roll(n) = H_natural(n) computed from Pitch(n) and ConnectorAngle.
+        '''   The TaperPct-derived linear taper is computed but stored only in H_natural
+        '''   for logging; it does NOT override the natural H.
+        '''   For Sinusoidal (ProfileType=0), UseNaturalH is ignored.
+        ''' </summary>
+        ' Diagnostic output from last ComputeRollMetrics call
+        Public _diagCRM As String = ""
+
+        Public Function ComputeRollMetrics() As RollMetrics
+            Dim rm As New RollMetrics()
+            If N <= 0 Then
+                rm.RollCount = 0
+                rm.RollStart = New Double() {}
+                rm.Pitch = New Double() {}
+                rm.H_eff_roll = New Double() {}
+                rm.H_natural = New Double() {}
+                _diagCRM = "N<=0, early return"
+                Return rm
+            End If
+
+            rm.RollCount = N
+
+            Dim rollStarts(N - 1) As Double
+            Dim pitches(N - 1) As Double
+            Dim hEffRolls(N - 1) As Double
+            Dim hNaturals(N - 1) As Double
+
+            Dim W_corr As Double = R_rolls_outer - R_roll_start
+
+            Dim basePitch As Double
+            If N > 0 Then
+                basePitch = W_corr / CDbl(N)
+            Else
+                basePitch = W_corr
+            End If
+
+            ' §4.5 — Variable pitch
+            Dim pitchTaperFrac As Double = 0.0
+            If VariablePitch Then
+                pitchTaperFrac = PitchTaperPct / 100.0
+            End If
+            Dim maxDelta As Double = basePitch * 0.90
+            Dim delta As Double = basePitch * pitchTaperFrac
+            If delta > maxDelta Then delta = maxDelta
+            If delta < -maxDelta Then delta = -maxDelta
+            Dim pitch_id_raw As Double = basePitch + delta
+            Dim pitch_od_raw As Double = basePitch - delta
+
+            _diagCRM = String.Format("W={0:F4} bp={1:F4} pidr={2:F4} podr={3:F4} N={4}", _
+                W_corr, basePitch, pitch_id_raw, pitch_od_raw, N)
+
+            ' Compute raw per-roll pitches and normalize
+            Dim pitchSum As Double = 0.0
+            For idx As Integer = 0 To N - 1
+                Dim t_n As Double
+                If N > 1 Then
+                    t_n = CDbl(idx) / CDbl(N - 1)
+                Else
+                    t_n = 0.0
+                End If
+                pitches(idx) = pitch_id_raw + (pitch_od_raw - pitch_id_raw) * t_n
+                pitchSum += pitches(idx)
+            Next
+
+            _diagCRM = _diagCRM & String.Format(" pSum={0:F4} p0={1:F4} p6={2:F4}", _
+                pitchSum, pitches(0), pitches(N - 1))
+
+            ' Normalize so pitches sum to W_corr exactly
+            If pitchSum > 0.0001 Then
+                Dim scale As Double = W_corr / pitchSum
+                For idx As Integer = 0 To N - 1
+                    pitches(idx) = pitches(idx) * scale
+                Next
+            End If
+
+            _diagCRM = _diagCRM & String.Format(" p0post={0:F4}", pitches(0))
+
+            ' Compute roll start radii
+            rollStarts(0) = R_roll_start
+            For idx As Integer = 1 To N - 1
+                rollStarts(idx) = rollStarts(idx - 1) + pitches(idx - 1)
+            Next
+
+            ' §4.4 — Taper (applied to H)
+            Dim taper_frac As Double = Math.Max(0.0, Math.Min(1.0, TaperPct / 100.0))
+            Dim hScale_inner As Double = Math.Max(0.10, 1.0 - taper_frac)
+            Dim hScale_outer As Double = 1.0
+            Dim h_outer As Double = H_eff
+
+            _diagCRM = _diagCRM & String.Format(" hOuter={0:F4}", h_outer)
+
+            For idx As Integer = 0 To N - 1
+                Dim t_n As Double
+                If N > 1 Then
+                    t_n = CDbl(idx) / CDbl(N - 1)
+                Else
+                    t_n = 0.0
+                End If
+                Dim hScale_n As Double = hScale_inner + (hScale_outer - hScale_inner) * t_n
+                Dim h_tapered As Double = h_outer * hScale_n
+
+                ' Compute natural H for ArcLines/SineLines (always, for logging)
+                If ProfileType = 2 Then
+                    hNaturals(idx) = ComputeNaturalH_ArcLines(pitches(idx), ConnectorAngle, StraightLength)
+                ElseIf ProfileType = 3 Then
+                    hNaturals(idx) = ComputeNaturalH_SineLines(pitches(idx), ConnectorAngle, StraightLength)
+                Else
+                    hNaturals(idx) = 0.0
+                End If
+
+                ' Determine effective H for this roll
+                If UseNaturalH AndAlso (ProfileType = 2 OrElse ProfileType = 3) Then
+                    hEffRolls(idx) = hNaturals(idx)
+                Else
+                    hEffRolls(idx) = h_tapered
+                End If
+            Next
+
+            ' Assign local arrays to class
+            rm.RollStart = rollStarts
+            rm.Pitch = pitches
+            rm.H_eff_roll = hEffRolls
+            rm.H_natural = hNaturals
+
+            Return rm
+        End Function
 
         ' ══════════════════════════════════════════════════════════════
         ' COMSOL Arc+Lines exact profile — decoded from STEP file
@@ -497,7 +707,7 @@ Imports System.Text
         ' User inputs:
         '   BulletR_Top   = R2, radius of center top arc (Arc 2)
         '   BulletCx      = Cx, distance from ID vertical construction line to
-        '                       Arc 2 center. Constrained to [width/3, 2·width/3].
+        '                       Arc 2 center. Constrained to [width/3, 2*width/3].
         '   InnerLipWidth = inner lip flat length (applies to all edge types)
         '
         ' Construction happens entirely in SWAutomation.CreatePart using
@@ -549,7 +759,7 @@ Imports System.Text
             Dim cxMin As Double = w / 3.0
             Dim cxMax As Double = 2.0 * w / 3.0
             If cx < cxMin OrElse cx > cxMax Then
-                Return String.Format("Cx={0:F2}mm must be between {1:F2} and {2:F2} (width/3 to 2·width/3).", _
+                Return String.Format("Cx={0:F2}mm must be between {1:F2} and {2:F2} (width/3 to 2*width/3).", _
                     cx, cxMin, cxMax)
             End If
             Return ""
@@ -585,8 +795,8 @@ Imports System.Text
             Dim C2z As Double = H - R2
             If C2z < 0 Then C2z = 0  ' clamp if R2 > H
 
-            ' For a reasonable 3-arc look, place T1 at (Cx - R2·sin(θ), C2z + R2·cos(θ))
-            ' where θ is chosen so Arc 1 tangent at (0,0) (vertical) is consistent.
+            ' For a reasonable 3-arc look, place T1 at (Cx - R2*sin(t), C2z + R2*cos(t))
+            ' where t is chosen so Arc 1 tangent at (0,0) (vertical) is consistent.
             ' Use seed points from user spec: Arc 2 starts roughly at (w/3, 2H/3).
             Dim seedT1r As Double = w / 3.0
             Dim seedT1z As Double = 2.0 * H / 3.0
@@ -610,17 +820,17 @@ Imports System.Text
 
             ' Arc 1: tangent to vertical at (0,0), passes through T1.
             ' Center at (R1, z1) on perpendicular to vertical (horizontal) through tangent point.
-            ' Simplest placement: tangent point at (0, 0) → center at (R1, 0).
-            ' Then (T1r - R1)² + T1z² = R1² → R1 = (T1r² + T1z²) / (2·T1r)
+            ' Simplest placement: tangent point at (0, 0) -> center at (R1, 0).
+            ' Then (T1r - R1)^2 + T1z^2 = R1^2 -> R1 = (T1r^2 + T1z^2) / (2*T1r)
             Dim R1 As Double = 0
             If T1r > 0.0001 Then R1 = (T1r * T1r + T1z * T1z) / (2.0 * T1r)
             Dim C1r As Double = R1
             Dim C1z As Double = 0.0
 
             ' Arc 3: tangent to vertical at (w, 0), passes through T2.
-            ' Center at (w - R3, 0). (T2r - (w - R3))² + T2z² = R3²
-            ' (w - T2r)² - 2R3(w - T2r) + R3² + T2z² = R3²
-            ' R3 = ((w - T2r)² + T2z²) / (2(w - T2r))
+            ' Center at (w - R3, 0). (T2r - (w - R3))^2 + T2z^2 = R3^2
+            ' (w - T2r)^2 - 2R3(w - T2r) + R3^2 + T2z^2 = R3^2
+            ' R3 = ((w - T2r)^2 + T2z^2) / (2(w - T2r))
             Dim R3 As Double = 0
             Dim dR As Double = w - T2r
             If dR > 0.0001 Then R3 = (dR * dR + T2z * T2z) / (2.0 * dR)
@@ -681,9 +891,9 @@ Imports System.Text
 
         Public Function GeneratePoints_Bullet(Optional ByVal ptsPerArc As Integer = 40) As List(Of ProfilePoint)
             ' Bullet uses absolute coords r = R_inner + local_x, where local_x spans [0, width].
-            ' Inner lip: (R_inner - InnerLipWidth, 0) → (R_inner, 0)
+            ' Inner lip: (R_inner - InnerLipWidth, 0) -> (R_inner, 0)
             ' Bullet:    three arcs from (R_inner, 0) up and over to (R_inner + width, 0)
-            ' Outer lip: (R_inner + width, 0) → (R_outer + LipWidth, 0)
+            ' Outer lip: (R_inner + width, 0) -> (R_outer + LipWidth, 0)
             Dim pts As New List(Of ProfilePoint)
             Dim w As Double = BulletWidth
             Dim bulletEndR As Double = R_inner + w
@@ -719,9 +929,21 @@ Imports System.Text
             pts.Add(New ProfilePoint(bulletEndR + LipWidth + 5.0, 0.0))
             Return pts
         End Function
+
+        ' ══════════════════════════════════════════════════════════════
+        ' Sinusoidal (ProfileType=0) — per-roll construction
+        '
+        ' Now uses ComputeRollMetrics() for per-roll pitch and H_eff.
+        ' When TaperPct=0 and VariablePitch=False: bit-for-bit identical
+        ' to the previous single-loop implementation.
+        '
+        ' Per-roll wave: Z_n(r) = dir_n * H_eff_n * sin(pi * (r - rs_n) / pitch_n)
+        ' Matches handoff §4.6.
+        ' ══════════════════════════════════════════════════════════════
         Public Function GeneratePoints_Sinusoidal(Optional ByVal pointsPerRoll As Integer = 30) As List(Of ProfilePoint)
             Dim pts As New List(Of ProfilePoint)
-            Dim dir As Double = If(FirstRollUp, 1.0, -1.0)
+            Dim dir0 As Double = If(FirstRollUp, 1.0, -1.0)
+            Dim rm As RollMetrics = ComputeRollMetrics()
 
             pts.Add(New ProfilePoint(R_inner, 0.0))
 
@@ -729,12 +951,24 @@ Imports System.Text
                 pts.Add(New ProfilePoint(R_roll_start, 0.0))
             End If
 
-            Dim totalPts As Integer = N * pointsPerRoll
-            For i As Integer = 1 To totalPts - 1
-                Dim xn As Double = CDbl(i) / CDbl(pointsPerRoll)
-                Dim rv As Double = R_roll_start + xn * EffPitch
-                Dim z As Double = dir * H_eff * Math.Sin(Math.PI * xn)
-                pts.Add(New ProfilePoint(rv, z))
+            For roll As Integer = 0 To N - 1
+                Dim d As Double = dir0 * If(roll Mod 2 = 0, 1.0, -1.0)
+                Dim rs As Double = rm.RollStart(roll)
+                Dim p As Double = rm.Pitch(roll)
+                Dim h As Double = rm.H_eff_roll(roll)
+
+                ' Points within this roll (k=1 to pointsPerRoll-1)
+                For k As Integer = 1 To pointsPerRoll - 1
+                    Dim t As Double = CDbl(k) / CDbl(pointsPerRoll)
+                    Dim rv As Double = rs + p * t
+                    Dim z As Double = d * h * Math.Sin(Math.PI * t)
+                    pts.Add(New ProfilePoint(rv, z))
+                Next
+
+                ' Zero-crossing at end of this roll (shared with start of next)
+                If roll < N - 1 Then
+                    pts.Add(New ProfilePoint(rs + p, 0.0))
+                End If
             Next
 
             pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
@@ -744,42 +978,55 @@ Imports System.Text
         End Function
 
         ' ══════════════════════════════════════════════════════════════
-        ' ArcLines (ProfileType=2)
+        ' ArcLines (ProfileType=2) — per-roll construction
+        '
+        ' Now uses ComputeRollMetrics() for per-roll pitch and H_eff.
+        ' When UseNaturalH=True: uses H_n_natural from pitch and angle,
+        '   no hScale vertical stretching. Preserves true arc geometry.
+        ' When UseNaturalH=False: uses H_eff_n with hScale as before.
+        ' When TaperPct=0 and VariablePitch=False and UseNaturalH=False:
+        '   bit-for-bit identical to the previous implementation.
         ' ══════════════════════════════════════════════════════════════
-
         Public Function GeneratePoints_ArcLines(Optional ByVal ptsPerRoll As Integer = 20) As List(Of ProfilePoint)
             Dim pts As New List(Of ProfilePoint)
             Dim PI As Double = Math.PI
+            Dim rm As RollMetrics = ComputeRollMetrics()
 
-            Dim pitch As Double = EffPitch
-            Dim h     As Double = H_eff
-            Dim s     As Double = Math.Max(0.0, Math.Min(StraightLength, pitch * 0.48))
             Dim theta As Double = Math.Max(0.1, Math.Min(89.9, ConnectorAngle)) * PI / 180.0
-            Dim sth   As Double = Math.Sin(theta)
-            Dim cth   As Double = Math.Cos(theta)
-            Dim r_j   As Double = (s / 2.0) * cth
-            Dim z_j   As Double = (s / 2.0) * sth
-            Dim wa    As Double = pitch - 2.0 * r_j
-            Dim a     As Double = wa / 2.0
-
-            Dim R_arc As Double = If(wa > 0.001 AndAlso sth > 0.001, a / sth, h)
-            Dim z_c   As Double = z_j - a * cth / Math.Max(sth, 0.001)
-
-            Dim H_geom As Double
-            If wa <= 0.001 Then
-                H_geom = h
-            Else
-                H_geom = z_j + a * (1.0 - cth) / Math.Max(sth, 0.001)
-            End If
-
-            Dim hScale As Double = If(H_geom > 0.001, h / H_geom, 1.0)
+            Dim sth As Double = Math.Sin(theta)
+            Dim cth As Double = Math.Cos(theta)
 
             pts.Add(New ProfilePoint(R_inner, 0.0))
 
             For roll As Integer = 0 To N - 1
                 Dim rollUp As Boolean = If(roll Mod 2 = 0, FirstRollUp, Not FirstRollUp)
                 Dim d      As Double  = If(rollUp, 1.0, -1.0)
-                Dim rs     As Double  = R_roll_start + roll * pitch
+                Dim rs     As Double  = rm.RollStart(roll)
+                Dim pitch  As Double  = rm.Pitch(roll)
+                Dim h      As Double  = rm.H_eff_roll(roll)  ' target H for this roll
+
+                ' Compute per-roll arc geometry from this roll's pitch
+                Dim s     As Double = Math.Max(0.0, Math.Min(StraightLength, pitch * 0.48))
+                Dim r_j   As Double = (s / 2.0) * cth
+                Dim z_j   As Double = (s / 2.0) * sth
+                Dim wa    As Double = pitch - 2.0 * r_j
+                Dim a_half As Double = wa / 2.0
+
+                Dim R_arc As Double = If(wa > 0.001 AndAlso sth > 0.001, a_half / sth, h)
+                Dim z_c   As Double = z_j - a_half * cth / Math.Max(sth, 0.001)
+
+                ' Compute natural H and hScale for this roll
+                Dim H_geom As Double
+                If wa <= 0.001 Then
+                    H_geom = h
+                Else
+                    H_geom = z_j + a_half * (1.0 - cth) / Math.Max(sth, 0.001)
+                End If
+
+                ' When UseNaturalH=True, h is already H_natural (set by ComputeRollMetrics),
+                ' so hScale = H_natural / H_geom = 1.0 (since H_geom IS H_natural).
+                ' When UseNaturalH=False, h is H_eff_n (from taper), hScale stretches to match.
+                Dim hScale As Double = If(H_geom > 0.001, h / H_geom, 1.0)
 
                 For k As Integer = 0 To ptsPerRoll
                     Dim r_loc As Double = pitch * CDbl(k) / CDbl(ptsPerRoll)
@@ -792,7 +1039,7 @@ Imports System.Text
                         z_abs = z_j * (r_loc / Math.Max(0.001, r_j))
                     ElseIf r_loc <= r_j + wa Then
                         Dim r_arc_loc As Double = r_loc - r_j
-                        Dim disc      As Double = R_arc * R_arc - (r_arc_loc - a) * (r_arc_loc - a)
+                        Dim disc      As Double = R_arc * R_arc - (r_arc_loc - a_half) * (r_arc_loc - a_half)
                         If disc < 0 Then disc = 0
                         z_abs = z_c + Math.Sqrt(disc)
                     Else
@@ -810,33 +1057,37 @@ Imports System.Text
         End Function
 
         ' ══════════════════════════════════════════════════════════════
-        ' SineLines (ProfileType=3)
+        ' SineLines (ProfileType=3) — per-roll construction
+        '
+        ' Same per-roll pattern as ArcLines. Uses ComputeRollMetrics().
+        ' UseNaturalH works the same way.
         ' ══════════════════════════════════════════════════════════════
-
         Public Function GeneratePoints_SineLines(Optional ByVal ptsPerRoll As Integer = 20) As List(Of ProfilePoint)
             Dim pts As New List(Of ProfilePoint)
             Dim PI As Double = Math.PI
+            Dim rm As RollMetrics = ComputeRollMetrics()
 
-            Dim pitch As Double = EffPitch
-            Dim h     As Double = H_eff
-            Dim s     As Double = Math.Max(0.0, Math.Min(StraightLength, pitch * 0.48))
             Dim theta As Double = Math.Max(0.1, Math.Min(89.9, ConnectorAngle)) * PI / 180.0
-            Dim sth   As Double = Math.Sin(theta)
-            Dim cth   As Double = Math.Cos(theta)
-            Dim r_j   As Double = (s / 2.0) * cth
-            Dim z_j   As Double = (s / 2.0) * sth
-            Dim wa    As Double = pitch - 2.0 * r_j
-            Dim amp   As Double = If(wa > 0.001, Math.Tan(theta) * wa / PI, h)
-
-            Dim H_geom As Double = If(wa > 0.001, z_j + amp, h)
-            Dim hScale As Double = If(H_geom > 0.001, h / H_geom, 1.0)
+            Dim sth As Double = Math.Sin(theta)
+            Dim cth As Double = Math.Cos(theta)
 
             pts.Add(New ProfilePoint(R_inner, 0.0))
 
             For roll As Integer = 0 To N - 1
                 Dim rollUp As Boolean = If(roll Mod 2 = 0, FirstRollUp, Not FirstRollUp)
                 Dim d      As Double  = If(rollUp, 1.0, -1.0)
-                Dim rs     As Double  = R_roll_start + roll * pitch
+                Dim rs     As Double  = rm.RollStart(roll)
+                Dim pitch  As Double  = rm.Pitch(roll)
+                Dim h      As Double  = rm.H_eff_roll(roll)
+
+                Dim s     As Double = Math.Max(0.0, Math.Min(StraightLength, pitch * 0.48))
+                Dim r_j   As Double = (s / 2.0) * cth
+                Dim z_j   As Double = (s / 2.0) * sth
+                Dim wa    As Double = pitch - 2.0 * r_j
+                Dim amp   As Double = If(wa > 0.001, Math.Tan(theta) * wa / PI, h)
+
+                Dim H_geom As Double = If(wa > 0.001, z_j + amp, h)
+                Dim hScale As Double = If(H_geom > 0.001, h / H_geom, 1.0)
 
                 For k As Integer = 0 To ptsPerRoll
                     Dim r_loc As Double = pitch * CDbl(k) / CDbl(ptsPerRoll)
@@ -865,7 +1116,7 @@ Imports System.Text
 
         ''' <summary>
         ''' Returns typed sketch segments for CreatePart.
-        ''' Straight sections → IsLine=True. Arc sections → IsLine=False (spline).
+        ''' Straight sections -> IsLine=True. Arc sections -> IsLine=False (spline).
         ''' For continuous profiles (Sin, Arc, COMSOL) returns one spline segment.
         ''' For ArcLines/SineLines returns alternating line+spline segments.
         ''' Arc-based edge profiles (HalfRoll, DoubleRoll) are handled by CreateArc
@@ -876,21 +1127,21 @@ Imports System.Text
 
             If ProfileType = 2 OrElse ProfileType = 3 Then
                 ' ArcLines or SineLines: alternate line segments and arc splines
-                Dim pitch As Double = EffPitch
-                Dim h As Double = H_eff
-                Dim straightFrac As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
-                Dim straightHalf As Double = (pitch / 2.0) * straightFrac
-                Dim arcHalf As Double = (pitch / 2.0) - straightHalf
+                ' Now uses per-roll geometry from ComputeRollMetrics
+                Dim rm As RollMetrics = ComputeRollMetrics()
+                Dim PI As Double = Math.PI
+                Dim theta As Double = Math.Max(0.1, Math.Min(89.9, ConnectorAngle)) * PI / 180.0
+                Dim sth As Double = Math.Sin(theta)
+                Dim cth As Double = Math.Cos(theta)
                 Dim ptsPerArc As Integer = Math.Max(6, ptsPerRoll \ 2)
 
-                Dim R_arc As Double = If(arcHalf > 0.001, arcHalf*arcHalf/(2.0*h) + h/2.0, h)
-                Dim halfAngle As Double = Math.Asin(Math.Min(1.0, arcHalf/R_arc))
+                ' Lead-in line from R_inner to first arc start
+                Dim s0 As Double = Math.Max(0.0, Math.Min(StraightLength, rm.Pitch(0) * 0.48))
+                Dim straightFrac0 As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
+                Dim straightHalf0 As Double = (rm.Pitch(0) / 2.0) * straightFrac0
+                Dim arcHalf0 As Double = (rm.Pitch(0) / 2.0) - straightHalf0
 
-                Dim firstUp As Boolean = FirstRollUp
-                Dim firstRc As Double = R_roll_start + 0.5 * pitch
-                Dim firstZc As Double = -(If(firstUp,1.0,-1.0)) * (R_arc - h)
-                Dim firstArcStartR As Double = firstRc - arcHalf
-                Dim firstArcStartZ As Double = If(straightHalf > 0.001, 0.0, firstZc + (If(firstUp,1.0,-1.0))*R_arc*Math.Cos(halfAngle))
+                Dim firstArcStartR As Double = rm.RollStart(0) + straightHalf0
 
                 Dim linePts As New List(Of ProfilePoint)
                 linePts.Add(New ProfilePoint(R_inner, 0.0))
@@ -900,7 +1151,20 @@ Imports System.Text
                 For roll As Integer = 0 To N - 1
                     Dim rollUp As Boolean = If(roll Mod 2 = 0, FirstRollUp, Not FirstRollUp)
                     Dim d As Double = If(rollUp, 1.0, -1.0)
-                    Dim Rc As Double = R_roll_start + (roll + 0.5) * pitch
+                    Dim pitch As Double = rm.Pitch(roll)
+                    Dim h As Double = rm.H_eff_roll(roll)
+                    Dim rs As Double = rm.RollStart(roll)
+
+                    Dim straightFrac As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
+                    Dim straightHalf As Double = (pitch / 2.0) * straightFrac
+                    Dim arcHalf As Double = (pitch / 2.0) - straightHalf
+
+                    Dim Rc As Double = rs + pitch / 2.0
+
+                    ' Compute arc geometry for this roll
+                    Dim R_arc As Double = If(arcHalf > 0.001, arcHalf*arcHalf/(2.0*h) + h/2.0, h)
+                    Dim halfAngle As Double = Math.Asin(Math.Min(1.0, arcHalf/R_arc))
+
                     Dim Zc As Double = -d * (R_arc - h)
 
                     Dim arcPts As New List(Of ProfilePoint)
@@ -911,8 +1175,8 @@ Imports System.Text
                         Next
                     Else  ' SineLines
                         Dim phaseFrac As Double = 1.0 - straightFrac
-                        Dim phaseStart As Double = Math.PI/2.0 - Math.PI/2.0*phaseFrac
-                        Dim phaseEnd As Double = Math.PI/2.0 + Math.PI/2.0*phaseFrac
+                        Dim phaseStart As Double = PI/2.0 - PI/2.0*phaseFrac
+                        Dim phaseEnd As Double = PI/2.0 + PI/2.0*phaseFrac
                         For k As Integer = 0 To ptsPerArc
                             Dim t As Double = CDbl(k)/CDbl(ptsPerArc)
                             Dim rv As Double = (Rc - arcHalf) + 2.0*arcHalf*t
@@ -922,7 +1186,17 @@ Imports System.Text
                     End If
                     segs.Add(New ProfileSegment(False, arcPts))
 
-                    Dim lineEndR As Double = If(roll < N-1, R_roll_start + (roll+1.5)*pitch - arcHalf, R_rolls_outer)
+                    ' Line from end of this arc to start of next (or to R_rolls_outer)
+                    Dim lineEndR As Double
+                    If roll < N - 1 Then
+                        Dim nextStraightFrac As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
+                        Dim nextStraightHalf As Double = (rm.Pitch(roll + 1) / 2.0) * nextStraightFrac
+                        Dim nextArcHalf As Double = (rm.Pitch(roll + 1) / 2.0) - nextStraightHalf
+                        lineEndR = rm.RollStart(roll + 1) + nextStraightHalf
+                    Else
+                        lineEndR = R_rolls_outer
+                    End If
+
                     Dim lp As New List(Of ProfilePoint)
                     lp.Add(New ProfilePoint(Rc + arcHalf, 0.0))
                     lp.Add(New ProfilePoint(lineEndR, 0.0))
@@ -1007,11 +1281,11 @@ Imports System.Text
                 Return crests
             End If
 
+            ' Spider profiles with per-roll pitch
+            Dim rm As RollMetrics = ComputeRollMetrics()
             Dim crestsS As New List(Of Double)
             For i As Integer = 0 To N - 1
-                Dim xn As Double = CDbl(i) + 0.5
-                Dim rv As Double = R_roll_start + xn * EffPitch
-                crestsS.Add(rv)
+                crestsS.Add(rm.RollStart(i) + rm.Pitch(i) / 2.0)
             Next
             Return crestsS
         End Function
@@ -1019,7 +1293,7 @@ Imports System.Text
         Public Function Summary() As String
             Dim sb As New StringBuilder()
             Dim modeStr As String = If(ComponentMode = 1, "Edge", "Spider")
-            sb.AppendLine(String.Format("=== {0} Profile Summary ===", modeStr))
+            sb.AppendLine(String.Format("=== {0} Profile Summary [STAGE1-v5] ===", modeStr))
             Dim profileName As String
             Select Case ProfileType
                 Case 1 : profileName = "Circular Arc"
@@ -1054,6 +1328,13 @@ Imports System.Text
                     BulletWidth, H_pp, BulletR_Top, GetBulletCx(), InnerLipWidth))
             End If
 
+            ' FEA calibration fields (show when non-default)
+            If TaperPct <> 0 OrElse VariablePitch OrElse UseNaturalH Then
+                sb.AppendLine(String.Format("TaperPct={0:F1}  VariablePitch={1}  PitchTaperPct={2:F1}  UseNaturalH={3}", _
+                    TaperPct, VariablePitch, PitchTaperPct, UseNaturalH))
+            End If
+
+            ' Roll crests
             Dim crests As List(Of Double) = GetRollCrestRadii()
             sb.Append("Roll crests (r): ")
             For i As Integer = 0 To crests.Count - 1
@@ -1061,6 +1342,60 @@ Imports System.Text
                 sb.Append(String.Format("{0:F2}", crests(i)))
             Next
             sb.AppendLine()
+
+            ' DIAGNOSTIC: always dump ComputeRollMetrics for debugging
+            If N > 0 Then
+                Dim rmDbg As RollMetrics = ComputeRollMetrics()
+                sb.AppendLine(String.Format("DIAG: rmDbg.RollCount={0}  rmDbg.Pitch is Nothing={1}", _
+                    rmDbg.RollCount, rmDbg.Pitch Is Nothing))
+                sb.AppendLine(String.Format("DIAG CRM: {0}", _diagCRM))
+                If rmDbg.Pitch IsNot Nothing AndAlso rmDbg.Pitch.Length > 0 Then
+                    sb.Append("DIAG pitch: ")
+                    For i As Integer = 0 To Math.Min(N - 1, rmDbg.Pitch.Length - 1)
+                        If i > 0 Then sb.Append(", ")
+                        sb.Append(String.Format("{0:F4}", rmDbg.Pitch(i)))
+                    Next
+                    sb.AppendLine()
+                    sb.Append("DIAG H_eff: ")
+                    For i As Integer = 0 To Math.Min(N - 1, rmDbg.H_eff_roll.Length - 1)
+                        If i > 0 Then sb.Append(", ")
+                        sb.Append(String.Format("{0:F4}", rmDbg.H_eff_roll(i)))
+                    Next
+                    sb.AppendLine()
+                    sb.Append("DIAG starts: ")
+                    For i As Integer = 0 To Math.Min(N - 1, rmDbg.RollStart.Length - 1)
+                        If i > 0 Then sb.Append(", ")
+                        sb.Append(String.Format("{0:F4}", rmDbg.RollStart(i)))
+                    Next
+                    sb.AppendLine()
+                End If
+            End If
+
+            ' Per-roll detail (show when taper, variable pitch, or natural H active)
+            If (TaperPct <> 0 OrElse VariablePitch OrElse UseNaturalH) AndAlso N > 0 Then
+                Dim rm As RollMetrics = ComputeRollMetrics()
+                sb.Append("Per-roll pitch: ")
+                For i As Integer = 0 To N - 1
+                    If i > 0 Then sb.Append(", ")
+                    sb.Append(String.Format("{0:F3}", rm.Pitch(i)))
+                Next
+                sb.AppendLine()
+                sb.Append("Per-roll H_eff: ")
+                For i As Integer = 0 To N - 1
+                    If i > 0 Then sb.Append(", ")
+                    sb.Append(String.Format("{0:F3}", rm.H_eff_roll(i)))
+                Next
+                sb.AppendLine()
+                If (ProfileType = 2 OrElse ProfileType = 3) Then
+                    sb.Append("Per-roll H_natural: ")
+                    For i As Integer = 0 To N - 1
+                        If i > 0 Then sb.Append(", ")
+                        sb.Append(String.Format("{0:F3}", rm.H_natural(i)))
+                    Next
+                    sb.AppendLine()
+                End If
+            End If
+
             Return sb.ToString()
         End Function
 
