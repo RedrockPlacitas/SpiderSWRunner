@@ -5,100 +5,103 @@ Imports Microsoft.VisualBasic
     Partial Public Class Form1
         Inherits Form
 
-        Private _sw As SWAutomation
+        Private WithEvents _sw As SWAutomation
         Private _suppressModeChange As Boolean = False
 
         Public Sub New()
             InitializeComponent()
             _sw = New SWAutomation(AddressOf LogMessage)
-            UpdateComputed()
+
+            ' Banner
             LogMessage("Spider / Edge -> SolidWorks Runner ready.")
-            LogMessage("")
             LogMessage("Workflow: Connect -> Create Part -> Setup Study -> Mesh+Run -> Extract")
             LogMessage("Or click 'Run All' to do everything in sequence.")
-            LogMessage("")
+
+            UpdateComputed()
         End Sub
 
-        ''' <summary>
-        ''' Short string tag for the current profile type, used in filenames.
-        ''' </summary>
         Private Function ProfileTag(p As SpiderProfile) As String
             Select Case p.ProfileType
                 Case 1 : Return "Arc"
                 Case 2 : Return "ArcLines"
                 Case 3 : Return "SineLines"
                 Case 10 : Return "HalfRoll"
-                Case 11 : Return "DblRoll"
+                Case 11 : Return "DoubleRoll"
                 Case 12 : Return "Bullet"
                 Case 99 : Return "COMSOL"
                 Case Else : Return "Sin"
             End Select
         End Function
 
-        ''' <summary>
-        ''' Build a unique output filename encoding ALL sweep-varying parameters.
-        ''' Prefix is Spider_ or Edge_ based on mode.
-        ''' </summary>
         Private Function BuildOutputFilename(p As SpiderProfile) As String
-            Dim prefix As String = If(p.ComponentMode = 1, "Edge", "Spider")
+            Dim modeStr As String = If(p.ComponentMode = 1, "Edge", "Spider")
             Dim tag As String = ProfileTag(p)
-            Dim anglePart As String = ""
-            If p.ProfileType >= 2 AndAlso p.ProfileType <= 3 Then
-                anglePart = "_A" & CInt(p.ConnectorAngle).ToString()
+            Dim base As String = String.Format("{0}_N{1}_ID{2}_OD{3}_{4}_Hpp{5:F1}_T{6:F1}_E{7:F1}_Nu{8:F2}", _
+                modeStr, p.N, CInt(p.ID), CInt(p.OD), tag, p.H_pp, p.T, p.E, p.Nu)
+            ' Add angle suffix for ArcLines/SineLines
+            If p.ProfileType = 2 OrElse p.ProfileType = 3 Then
+                base = base & String.Format("_A{0}", CInt(p.ConnectorAngle))
             End If
-            Dim flatPart As String = ""
-            If p.ProfileType = 11 Then
-                flatPart = "_F" & p.CenterFlat.ToString("F1").TrimEnd("0"c).TrimEnd("."c)
+            ' Add taper suffix if non-zero
+            If p.TaperPct <> 0 Then
+                base = base & String.Format("_Tp{0}", CInt(p.TaperPct))
             End If
-            Dim bulletPart As String = ""
-            If p.ProfileType = 12 Then
-                bulletPart = "_R2" & p.BulletR_Top.ToString("F1").TrimEnd("0"c).TrimEnd("."c) & _
-                             "_Cx" & p.GetBulletCx().ToString("F1").TrimEnd("0"c).TrimEnd("."c)
+            ' Add pitch taper suffix if active
+            If p.VariablePitch AndAlso p.PitchTaperPct <> 0 Then
+                base = base & String.Format("_Pt{0}", CInt(p.PitchTaperPct))
             End If
-            Return String.Format( _
-                "{0}_N{1}_ID{2}_OD{3}_{4}_Hpp{5:F1}_T{6}_E{7}_Nu{8}{9}{10}{11}_auto.csv", _
-                prefix, p.N, CInt(p.ID), CInt(p.OD), tag, _
-                p.H_pp, _
-                p.T.ToString("F2").TrimEnd("0"c).TrimEnd("."c), _
-                p.E.ToString("F1").TrimEnd("0"c).TrimEnd("."c), _
-                p.Nu.ToString("F2").TrimEnd("0"c).TrimEnd("."c), _
-                anglePart, flatPart, bulletPart)
+            ' Add natural H marker
+            If p.UseNaturalH Then
+                base = base & "_natH"
+            End If
+            base = base & "_auto.csv"
+            Return base
         End Function
 
         Private Function D(ByVal tb As TextBox, ByVal def As Double) As Double
-            Dim v As Double
-            If Double.TryParse(tb.Text, v) Then Return v
+            Dim val As Double
+            If Double.TryParse(tb.Text, val) Then
+                Return val
+            End If
             Return def
         End Function
 
         Private Function I(ByVal tb As TextBox, ByVal def As Integer) As Integer
-            Dim v As Integer
-            If Integer.TryParse(tb.Text, v) Then Return v
+            Dim val As Integer
+            If Integer.TryParse(tb.Text, val) Then
+                Return val
+            End If
             Return def
         End Function
 
         ''' <summary>
-        ''' Map cbProfile.SelectedIndex to ProfileType integer based on current mode.
-        ''' Spider: 0=Sin, 1=Arc, 2=ArcLines, 3=SineLines
-        ''' Edge:   0=HalfRoll, 1=DoubleRoll, 2=Sin, 3=Arc, 4=ArcLines, 5=SineLines
+        ''' Map the profile combo's selected index to a ProfileType integer.
+        ''' Spider mode: 0=Sinusoidal, 1=CircularArc, 2=ArcLines, 3=SineLines
+        ''' Edge mode:   10=HalfRoll, 11=DoubleRoll, 12=Bullet, then 0,1,2,3
         ''' </summary>
         Private Function ProfileTypeFromCombo() As Integer
-            Dim idx As Integer = If(cbProfile IsNot Nothing, cbProfile.SelectedIndex, 0)
-            If cbMode IsNot Nothing AndAlso cbMode.SelectedIndex = 1 Then
-                ' Edge mode
+            Dim idx As Integer = cbProfile.SelectedIndex
+            Dim isEdge As Boolean = (cbMode IsNot Nothing AndAlso cbMode.SelectedIndex = 1)
+
+            If isEdge Then
                 Select Case idx
                     Case 0 : Return 10  ' Half Roll
                     Case 1 : Return 11  ' Double Roll
                     Case 2 : Return 12  ' Bullet
                     Case 3 : Return 0   ' Sinusoidal
                     Case 4 : Return 1   ' Circular Arc
-                    Case 5 : Return 2   ' ArcLines
-                    Case 6 : Return 3   ' SineLines
+                    Case 5 : Return 2   ' Arc+Lines
+                    Case 6 : Return 3   ' Sine+Lines
                     Case Else : Return 10
                 End Select
             Else
-                ' Spider mode: direct mapping
-                Return idx
+                Select Case idx
+                    Case 0 : Return 0   ' Sinusoidal
+                    Case 1 : Return 1   ' Circular Arc
+                    Case 2 : Return 2   ' Arc+Lines
+                    Case 3 : Return 3   ' Sine+Lines
+                    Case Else : Return 0
+                End Select
             End If
         End Function
 
@@ -155,6 +158,20 @@ Imports Microsoft.VisualBasic
             If p.ProfileType = 11 Then p.N = 2
             If p.ProfileType = 12 Then p.N = 1
 
+            ' FEA calibration controls
+            If tbTaperPct IsNot Nothing Then
+                p.TaperPct = D(tbTaperPct, 0.0)
+            End If
+            If chkVariablePitch IsNot Nothing Then
+                p.VariablePitch = chkVariablePitch.Checked
+            End If
+            If tbPitchTaperPct IsNot Nothing Then
+                p.PitchTaperPct = D(tbPitchTaperPct, 0.0)
+            End If
+            If chkUseNaturalH IsNot Nothing Then
+                p.UseNaturalH = chkUseNaturalH.Checked
+            End If
+
             Return p
         End Function
 
@@ -205,6 +222,11 @@ Imports Microsoft.VisualBasic
                 chkCOMSOL.Visible = False
                 chkCOMSOL.Checked = False
 
+                ' Hide calibration group (not relevant for edges)
+                If grpCalibration IsNot Nothing Then
+                    grpCalibration.Visible = False
+                End If
+
                 ' Show/hide edge-specific controls
                 UpdateEdgeProfileControls()
             Else
@@ -231,6 +253,11 @@ Imports Microsoft.VisualBasic
 
                 ' Show COMSOL checkbox
                 chkCOMSOL.Visible = True
+
+                ' Show calibration group
+                If grpCalibration IsNot Nothing Then
+                    grpCalibration.Visible = True
+                End If
 
                 ' Hide edge-specific controls, show spider controls
                 lblCenterFlat.Visible = False
@@ -480,11 +507,29 @@ Imports Microsoft.VisualBasic
             txtLog.Clear()
         End Sub
 
+        ' ══════════════════════════════════════
+        '  CALIBRATION CONTROL EVENTS
+        ' ══════════════════════════════════════
+
+        Private Sub chkVariablePitch_CheckedChanged(ByVal sender As Object, ByVal e As EventArgs) _
+            Handles chkVariablePitch.CheckedChanged
+            ' Enable/disable PitchTaperPct textbox based on checkbox
+            If tbPitchTaperPct IsNot Nothing Then
+                tbPitchTaperPct.Enabled = chkVariablePitch.Checked
+                If Not chkVariablePitch.Checked Then
+                    tbPitchTaperPct.Text = "0"
+                End If
+            End If
+            UpdateComputed()
+        End Sub
+
         Private Sub GeometryChanged(ByVal sender As Object, ByVal e As EventArgs) _
             Handles tbID.TextChanged, tbOD.TextChanged, tbN.TextChanged, _
                     tbHpp.TextChanged, tbT.TextChanged, tbLipWidth.TextChanged, _
                     cbFirstRoll.SelectedIndexChanged, _
-                    tbBulletRid.TextChanged, tbBulletRtop.TextChanged, tbBulletRod.TextChanged
+                    tbBulletRid.TextChanged, tbBulletRtop.TextChanged, tbBulletRod.TextChanged, _
+                    tbTaperPct.TextChanged, tbPitchTaperPct.TextChanged, _
+                    chkUseNaturalH.CheckedChanged
             UpdateComputed()
         End Sub
 

@@ -16,8 +16,8 @@
 
         Private Sub InitializeComponent()
             Me.Text = "Spider / Edge -> SolidWorks Runner"
-            Me.ClientSize = New System.Drawing.Size(700, 790)
-            Me.MinimumSize = New System.Drawing.Size(700, 640)
+            Me.ClientSize = New System.Drawing.Size(700, 870)
+            Me.MinimumSize = New System.Drawing.Size(700, 720)
             Me.Font = New System.Drawing.Font("Segoe UI", 9.0F)
 
             Dim yPos As Integer = 8
@@ -128,12 +128,41 @@
             tbSteps = AddTextBox(grpSim, "40", 120, sy, 55)
             sy += 28
             AddLabel(grpSim, "Output folder:", 10, sy)
-            tbOutputDir = AddTextBox(grpSim, "C:\SpiderSW_Results", 120, sy, 215)
+            tbOutputDir = AddTextBox(grpSim, "C:\SpiderSW_Results\PhaseA_20260414", 120, sy, 215)
+
+            ' ══════════════════════════════════════
+            '  FEA CALIBRATION GROUP
+            '  Spider mode only. Controls taper, variable pitch, and
+            '  UseNaturalH for the FEA calibration campaign.
+            ' ══════════════════════════════════════
+            grpCalibration = New System.Windows.Forms.GroupBox()
+            grpCalibration.Text = "FEA Calibration"
+            grpCalibration.Location = New System.Drawing.Point(8, yPos + 188)
+            grpCalibration.Size = New System.Drawing.Size(320, 70)
+            Me.Controls.Add(grpCalibration)
+
+            Dim cy As Integer = 18
+            AddLabel(grpCalibration, "Taper%:", 10, cy)
+            tbTaperPct = AddTextBox(grpCalibration, "0", 65, cy, 45)
+            chkVariablePitch = New System.Windows.Forms.CheckBox()
+            chkVariablePitch.Text = "Variable Pitch"
+            chkVariablePitch.Location = New System.Drawing.Point(120, cy)
+            chkVariablePitch.Size = New System.Drawing.Size(105, 20)
+            grpCalibration.Controls.Add(chkVariablePitch)
+            AddLabel(grpCalibration, "Pt%:", 230, cy)
+            tbPitchTaperPct = AddTextBox(grpCalibration, "0", 258, cy, 38)
+            tbPitchTaperPct.Enabled = False
+            cy += 26
+            chkUseNaturalH = New System.Windows.Forms.CheckBox()
+            chkUseNaturalH.Text = "Use Natural H (ArcLines/SineLines only)"
+            chkUseNaturalH.Location = New System.Drawing.Point(10, cy)
+            chkUseNaturalH.Size = New System.Drawing.Size(290, 20)
+            grpCalibration.Controls.Add(chkUseNaturalH)
 
             ' ══════════════════════════════════════
             '  BUTTONS — Row 1: main workflow
             ' ══════════════════════════════════════
-            yPos += 220
+            yPos += 300
             Dim bw As Integer = 130
             Dim bh As Integer = 32
             Dim gap As Integer = 4
@@ -159,8 +188,13 @@
             chkCOMSOL.Checked = False
             Me.Controls.Add(chkCOMSOL)
 
-            ' Profile type combo
-            lblProfile = AddLabelCtrl(Me, "Profile:", 8, yPos + bh + 30)
+            ' Profile combo
+            lblProfile = New System.Windows.Forms.Label()
+            lblProfile.Text = "Profile:"
+            lblProfile.Location = New System.Drawing.Point(8, yPos + bh + 30)
+            lblProfile.AutoSize = True
+            Me.Controls.Add(lblProfile)
+
             cbProfile = New System.Windows.Forms.ComboBox()
             cbProfile.Location = New System.Drawing.Point(70, yPos + bh + 27)
             cbProfile.Size = New System.Drawing.Size(130, 22)
@@ -232,6 +266,7 @@
         Friend WithEvents grpGeometry As System.Windows.Forms.GroupBox
         Friend WithEvents grpMaterial As System.Windows.Forms.GroupBox
         Friend WithEvents grpSim As System.Windows.Forms.GroupBox
+        Friend WithEvents grpCalibration As System.Windows.Forms.GroupBox
         Friend WithEvents lblID As System.Windows.Forms.Label
         Friend WithEvents lblOD As System.Windows.Forms.Label
         Friend WithEvents tbID As System.Windows.Forms.TextBox
@@ -249,6 +284,10 @@
         Friend WithEvents tbMaxDisp As System.Windows.Forms.TextBox
         Friend WithEvents tbSteps As System.Windows.Forms.TextBox
         Friend WithEvents tbOutputDir As System.Windows.Forms.TextBox
+        Friend WithEvents tbTaperPct As System.Windows.Forms.TextBox
+        Friend WithEvents tbPitchTaperPct As System.Windows.Forms.TextBox
+        Friend WithEvents chkVariablePitch As System.Windows.Forms.CheckBox
+        Friend WithEvents chkUseNaturalH As System.Windows.Forms.CheckBox
         Friend WithEvents btnConnect As System.Windows.Forms.Button
         Friend WithEvents btnCreatePart As System.Windows.Forms.Button
         Friend WithEvents btnSetupStudy As System.Windows.Forms.Button
