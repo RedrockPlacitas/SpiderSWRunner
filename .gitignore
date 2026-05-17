@@ -12,3 +12,13 @@ obj/
 ~$*
 Thumbs.db
 .vs/
+
+TriRadius-SpiderNL.*
+*.CWR
+
+# SW Simulation artifacts
+TriRadius-SpiderNL.*
+*.CWR
+*.NP3
+*.PDP
+PerformanceLog.txt
