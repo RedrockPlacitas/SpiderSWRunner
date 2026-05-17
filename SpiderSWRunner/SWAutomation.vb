@@ -76,6 +76,12 @@ Imports SolidWorks.Interop.cosworks
                 System.Runtime.InteropServices.Marshal.CleanupUnusedObjectsInCurrentContext()
                 System.Threading.Thread.Sleep(500)  ' give SW time to fully close
             Catch : End Try
+
+            ' ── TriRadius (ProfileType=17): open template and drive dimensions ──
+            If profile.ProfileType = 17 Then
+                Return CreatePartFromTriRadiusTemplate(profile)
+            End If
+
             Try
                 Dim templatePath As String = _swApp.GetUserPreferenceStringValue( _
                     CInt(swUserPreferenceStringValue_e.swDefaultTemplatePart))
@@ -611,32 +617,46 @@ Imports SolidWorks.Interop.cosworks
                         rolls(rolls.Count - 1).R_end / 1000.0, 0, 0, _
                         (profile.R_rolls_outer + profile.LipWidth + 5.0) / 1000.0, 0, 0)
                 Else
-                    ' ── All other profile types: existing single-spline path ──
-                    ' Deduplicate consecutive points (ArcLines/SineLines have Z=0 duplicates at junctions)
-                    Dim cleanPts As New List(Of ProfilePoint)
-                    cleanPts.Add(pts(0))
-                    For i As Integer = 1 To pts.Count - 2
-                        Dim prev As ProfilePoint = cleanPts(cleanPts.Count - 1)
-                        If Math.Abs(pts(i).R - prev.R) > 0.0005 OrElse Math.Abs(pts(i).Z - prev.Z) > 0.0005 Then
-                            cleanPts.Add(pts(i))
+                    ' ── All other profile types: use GetSketchSegments for line+spline ──
+                    ' GetSketchSegments returns alternating line (IsLine=True) and spline
+                    ' (IsLine=False) segments. Drawing them separately prevents spline
+                    ' oscillation at flat-to-corrugation transitions.
+                    Dim segs As List(Of ProfileSegment) = profile.GetSketchSegments(30)
+                    For si As Integer = 0 To segs.Count - 1
+                        Dim seg As ProfileSegment = segs(si)
+                        If seg.IsLine Then
+                            ' Draw as a line from first to last point
+                            If seg.Points.Count >= 2 Then
+                                _model.SketchManager.CreateLine( _
+                                    seg.Points(0).R / 1000.0, seg.Points(0).Z / 1000.0, 0, _
+                                    seg.Points(seg.Points.Count - 1).R / 1000.0, _
+                                    seg.Points(seg.Points.Count - 1).Z / 1000.0, 0)
+                            End If
+                        Else
+                            ' Draw as a spline, deduplicating consecutive points
+                            Dim cleanPts As New List(Of ProfilePoint)
+                            cleanPts.Add(seg.Points(0))
+                            For i As Integer = 1 To seg.Points.Count - 1
+                                Dim prev As ProfilePoint = cleanPts(cleanPts.Count - 1)
+                                If Math.Abs(seg.Points(i).R - prev.R) > 0.0005 OrElse _
+                                   Math.Abs(seg.Points(i).Z - prev.Z) > 0.0005 Then
+                                    cleanPts.Add(seg.Points(i))
+                                End If
+                            Next
+
+                            Dim nSp As Integer = cleanPts.Count
+                            Dim spArr(nSp * 3 - 1) As Double
+                            For i As Integer = 0 To nSp - 1
+                                spArr(i * 3)     = cleanPts(i).R / 1000.0
+                                spArr(i * 3 + 1) = cleanPts(i).Z / 1000.0
+                                spArr(i * 3 + 2) = 0
+                            Next
+                            Dim spline As Object = _model.SketchManager.CreateSpline2(spArr, False)
+                            If spline Is Nothing Then spline = _model.SketchManager.CreateSpline(CObj(spArr))
+                            Log(String.Format("  Spline: {0} pts (from {1} raw)", nSp, seg.Points.Count))
                         End If
                     Next
-
-                    Dim nSp As Integer = cleanPts.Count
-                    Dim spArr(nSp * 3 - 1) As Double
-                    For i As Integer = 0 To nSp - 1
-                        spArr(i * 3)     = cleanPts(i).R / 1000.0
-                        spArr(i * 3 + 1) = cleanPts(i).Z / 1000.0
-                        spArr(i * 3 + 2) = 0
-                    Next
-                    Dim spline As Object = _model.SketchManager.CreateSpline2(spArr, False)
-                    If spline Is Nothing Then spline = _model.SketchManager.CreateSpline(CObj(spArr))
-                    Log(String.Format("  Spline: {0} pts (from {1} raw)", nSp, pts.Count))
-
-                    ' Outer lip line
-                    _model.SketchManager.CreateLine( _
-                        cleanPts(cleanPts.Count - 1).R / 1000.0, 0, 0, _
-                        pts(pts.Count - 1).R / 1000.0, 0, 0)
+                    Log(String.Format("  Segments: {0} drawn", segs.Count))
                 End If
 
                 ' Close sketch, revolve
@@ -665,6 +685,99 @@ Imports SolidWorks.Interop.cosworks
             Catch ex As System.Exception
                 Log("ERROR in CreatePart: " & ex.Message)
                 Return False
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' TriRadius — open template part and drive dimensions
+        ' ──────────────────────────────────────────────────────────────
+        Private Function CreatePartFromTriRadiusTemplate(ByVal profile As SpiderProfile) As Boolean
+            Try
+                Dim templatePath As String = "C:\Projects\SpiderSWRunner\TriRadius.SLDPRT"
+                Log("── TriRadius: opening template ──")
+                Log("  Template: " & templatePath)
+
+                If Not System.IO.File.Exists(templatePath) Then
+                    Log("ERROR: Template not found: " & templatePath)
+                    Return False
+                End If
+
+                ' Open (or activate if already open)
+                Dim docErr As Integer = 0
+                Dim docWarn As Integer = 0
+                _model = DirectCast(_swApp.OpenDoc6(templatePath, _
+                    CInt(swDocumentTypes_e.swDocPART), 0, "", docErr, docWarn), ModelDoc2)
+                If _model Is Nothing Then
+                    ' Might already be open — try to activate
+                    _model = DirectCast(_swApp.ActivateDoc3(templatePath, True, 0, docErr), ModelDoc2)
+                End If
+                If _model Is Nothing Then
+                    Log(String.Format("ERROR: Could not open template (err={0})", docErr))
+                    Return False
+                End If
+                Log("  Template opened OK")
+
+                ' Drive dimensions (SW stores in meters, input is mm)
+                SetDimensionMM("Cone ID@Sketch2", profile.R_inner)
+                SetDimensionMM("Basket ID@Sketch2", profile.R_outer)
+                SetDimensionMM("Height@Sketch2", profile.H_pp)
+                SetDimensionMM("R2 Radius@Sketch2", profile.BulletCx)
+                SetDimensionMM("R2 Center@Sketch2", profile.BulletR_Top)
+                SetDimensionMM("InnerLip@Sketch2", profile.InnerLipWidth)
+                SetDimensionMM("OuterLip@Sketch2", profile.LipWidth)
+
+                ' Rebuild to update driven dimensions
+                Log("  Rebuilding...")
+                _model.EditRebuild3()
+
+                ' Read driven (tangency-solved) dimensions
+                Dim r1 As Double = GetDimensionMM("R1 Radius@Sketch2")
+                Dim r3 As Double = GetDimensionMM("R3 Radius@Sketch2")
+                Log(String.Format("  R1 Radius (driven) = {0:F3}mm", r1))
+                Log(String.Format("  R3 Radius (driven) = {0:F3}mm", r3))
+
+                _model.ViewZoomtofit2()
+                Log("TriRadius part complete.")
+                Log(profile.Summary())
+                Return True
+            Catch ex As System.Exception
+                Log("ERROR in TriRadius template: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Set a named dimension in the active model (value in mm).
+        ''' </summary>
+        Private Sub SetDimensionMM(ByVal dimName As String, ByVal value_mm As Double)
+            Try
+                Dim swDim As Object = _model.Parameter(dimName)
+                If swDim IsNot Nothing Then
+                    swDim.SystemValue = value_mm / 1000.0
+                    Log(String.Format("  Set {0} = {1:F2}mm", dimName, value_mm))
+                Else
+                    Log(String.Format("  WARNING: Dimension '{0}' not found", dimName))
+                End If
+            Catch ex As System.Exception
+                Log(String.Format("  ERROR setting '{0}': {1}", dimName, ex.Message))
+            End Try
+        End Sub
+
+        ''' <summary>
+        ''' Read a named dimension from the active model (returns mm).
+        ''' </summary>
+        Private Function GetDimensionMM(ByVal dimName As String) As Double
+            Try
+                Dim swDim As Object = _model.Parameter(dimName)
+                If swDim IsNot Nothing Then
+                    Return swDim.SystemValue * 1000.0
+                Else
+                    Log(String.Format("  WARNING: Dimension '{0}' not found for read", dimName))
+                    Return 0.0
+                End If
+            Catch ex As System.Exception
+                Log(String.Format("  ERROR reading '{0}': {1}", dimName, ex.Message))
+                Return 0.0
             End Try
         End Function
 
@@ -856,6 +969,7 @@ Imports SolidWorks.Interop.cosworks
                     Dim applied As Boolean = False
                     For Each db As String In New String() { _
                         "Spider Materials", _
+                        "Edge_Materials", _
                         "", _
                         "Custom Materials", _
                         "solidworks materials"}
@@ -893,19 +1007,31 @@ Imports SolidWorks.Interop.cosworks
                                 ' Try SetLibraryMaterial on the COMPONENT (not body)
                                 Try
                                     CallByName(compObj, "SetLibraryMaterial", CallType.Method, _
-                                        "Spider Materials", profile.MaterialName)
-                                    Log("  Component SetLibraryMaterial: OK")
+                                        "Edge_Materials", profile.MaterialName)
+                                    Log("  Component SetLibraryMaterial (Edge_Materials): OK")
                                 Catch ex2 As System.Exception
-                                    Log("  Component SetLibraryMaterial: " & ex2.Message)
+                                    Try
+                                        CallByName(compObj, "SetLibraryMaterial", CallType.Method, _
+                                            "Spider Materials", profile.MaterialName)
+                                        Log("  Component SetLibraryMaterial (Spider Materials): OK")
+                                    Catch ex3 As System.Exception
+                                        Log("  Component SetLibraryMaterial: " & ex3.Message)
+                                    End Try
                                 End Try
 
                                 ' Also try on body index 0 with error handling
                                 Try
                                     Dim body As CWSolidBody = comp.GetSolidBodyAt(0, smErr)
                                     If body IsNot Nothing Then
-                                        CallByName(DirectCast(body, Object), "SetLibraryMaterial", _
-                                            CallType.Method, "Spider Materials", profile.MaterialName)
-                                        Log("  Body SetLibraryMaterial: OK")
+                                        Try
+                                            CallByName(DirectCast(body, Object), "SetLibraryMaterial", _
+                                                CallType.Method, "Edge_Materials", profile.MaterialName)
+                                            Log("  Body SetLibraryMaterial (Edge_Materials): OK")
+                                        Catch
+                                            CallByName(DirectCast(body, Object), "SetLibraryMaterial", _
+                                                CallType.Method, "Spider Materials", profile.MaterialName)
+                                            Log("  Body SetLibraryMaterial (Spider Materials): OK")
+                                        End Try
                                     Else
                                         Log(String.Format("  GetSolidBodyAt: err={0} (expected for shells)", smErr))
                                     End If
@@ -951,8 +1077,13 @@ Imports SolidWorks.Interop.cosworks
                             End Try
                             Try
                                 CallByName(DirectCast(sh, Object), "SetLibraryMaterial", CallType.Method, _
-                                    "Spider Materials", profile.MaterialName)
+                                    "Edge_Materials", profile.MaterialName)
                             Catch
+                                Try
+                                    CallByName(DirectCast(sh, Object), "SetLibraryMaterial", CallType.Method, _
+                                        "Spider Materials", profile.MaterialName)
+                                Catch
+                                End Try
                             End Try
                             sh.ShellEndEdit()
                         End If
@@ -1228,40 +1359,15 @@ Imports SolidWorks.Interop.cosworks
                         Catch
                         End Try
 
-                        Dim stepSet As Boolean = False
-                        For Each pName As String In New String() { _
-                            "AutoTimeStep", "AutoStepping", "TimeStepOption", _
-                            "SolutionControl", "UseAutoStepping"}
-                            Try
-                                CallByName(opts, pName, CallType.Set, 0)
-                                Log(String.Format("  {0} = 0 (fixed stepping)", pName))
-                                stepSet = True
-                                Exit For
-                            Catch
-                            End Try
-                        Next
+                        ' Set Fixed step size (value pre-loads into dialog)
+                        Dim stepSize As Double = 1.0 / CDbl(nSteps)
+                        Try
+                            CallByName(opts, "FixedTimeIncrement", CallType.Set, stepSize)
+                            Log(String.Format("  FixedTimeIncrement = {0:F6} ({1} steps)", stepSize, nSteps))
+                        Catch
+                        End Try
 
-                        For Each pName As String In New String() { _
-                            "FixedIncrementTimeIncrement", "TimeIncrement", _
-                            "InitialTimeIncrement", "FixedTimeStep"}
-                            Try
-                                CallByName(opts, pName, CallType.Set, 1.0 / CDbl(nSteps))
-                                Log(String.Format("  {0} = {1:F4}", pName, 1.0 / CDbl(nSteps)))
-                                stepSet = True
-                                Exit For
-                            Catch
-                            End Try
-                        Next
-
-                        If Not stepSet Then
-                            Log("  Could not set time stepping. NL options members:")
-                            Dim oType As Type = opts.GetType()
-                            For Each m As MemberInfo In oType.GetMembers()
-                                If m.MemberType = MemberTypes.Property Then
-                                    Log("    " & m.Name)
-                                End If
-                            Next
-                        End If
+                        Log("  *** MANUAL: Study Properties -> click 'Fixed' radio -> OK ***")
                     Else
                         Log("  Could not find options. Enumerating study members...")
                         Dim stType As Type = _study.GetType()
@@ -1382,88 +1488,54 @@ Imports SolidWorks.Interop.cosworks
         ' STEP 5a — Enumerate Results (SW2014-specific probing)
         ' ──────────────────────────────────────────────────────────────
         Public Sub EnumerateResults(ByVal profile As SpiderProfile)
+            ' Stress API diagnostic probe (kept for future API changes / debugging)
             Try
                 If Not ReconnectStudy() Then Return
-                If _idEdge Is Nothing OrElse _odEdge Is Nothing Then
-                    If _model Is Nothing Then
-                        Try : _model = DirectCast(_swApp.ActiveDoc, ModelDoc2) : Catch : End Try
-                    End If
-                    If _model IsNot Nothing Then FindCircularEdges(profile, _idEdge, _odEdge)
-                End If
                 Dim results As CWResults = _study.Results
-                If results Is Nothing Then Log("no results") : Return
+                Dim mesh As CWMesh = _study.Mesh
+                If results Is Nothing Then Log("PROBE: no results — solve first") : Return
+                If mesh Is Nothing Then Log("PROBE: no mesh") : Return
 
-                ' 1. Get ID edge node IDs from GetDisplacementForEntities(comp=2, step=13)
-                ' Then probe DispAllSteps for node 1482 to find which slot = axial UY
-                Dim idNode As Integer = -1
+                Dim stepNum As Integer = 1
+                Try
+                    Dim v As Object = CallByName(DirectCast(results, Object), "GetMaximumAvailableSteps", CallType.Method)
+                    If v IsNot Nothing Then stepNum = CInt(v)
+                Catch : End Try
+
+                Log("========================================")
+                Log("  STRESS API DIAGNOSTIC PROBE")
+                Log("========================================")
+                Log(String.Format("  stepNum={0}  mesh.NodeCount={1}", stepNum, mesh.NodeCount))
+
+                Log("[GetMinMaxStress]  (Tier 3 fast API)")
                 Try
                     Dim st As Integer = 0
-                    Dim eArr() As Object = New Object() {DirectCast(_idEdge, Object)}
-                    Dim oa() As Object = DirectCast(results.GetDisplacementForEntities(2, 13, Nothing, eArr, 0, st), Object())
-                    idNode = CInt(oa(0))
-                    Log(String.Format("ID edge node0: id={0}  comp2_val={1:F6}mm at step13", idNode, CDbl(oa(1))))
-                Catch ex As Exception : Log("IDedge err: " & ex.Message) : End Try
+                    Dim oa() As Object = DirectCast( _
+                        results.GetMinMaxStress(9, -1, stepNum, Nothing, 0, st), Object())
+                    Log(String.Format("    SUCCESS  len={0}  maxVal={1:F4} MPa  maxNode={2}", _
+                        oa.Length, CDbl(oa(3)) / 1000000.0, CInt(oa(2))))
+                Catch ex As Exception
+                    Log("    FAILED: " & ex.Message)
+                End Try
 
-                ' 2. GetDisplacementForEntities comp=3 (try UY or UZ) for ID edge at step 13
-                For comp As Integer = 1 To 4
-                    Try
-                        Dim st As Integer = 0
-                        Dim eArr() As Object = New Object() {DirectCast(_idEdge, Object)}
-                        Dim oa() As Object = DirectCast(results.GetDisplacementForEntities(comp, 13, Nothing, eArr, 0, st), Object())
-                        Log(String.Format("IDedge comp={0} step13: [0]={1:E4} [1]={2:F6}", comp, CDbl(oa(0)), CDbl(oa(1))))
-                    Catch ex As Exception : Log("IDedge comp=" & comp & " err: " & ex.Message) : End Try
-                Next
+                Log("[GetStressComponentForAllStepsAtNode]  (per-node API)")
+                Try
+                    Dim st As Integer = 0
+                    Dim oa() As Object = DirectCast( _
+                        results.GetStressComponentForAllStepsAtNode(9, 1, Nothing, 0, st), Object())
+                    If oa.Length >= 3 * stepNum Then
+                        Log(String.Format("    SUCCESS  nodeID=1 step{0} VM={1:E4} Pa = {2:F4} MPa", _
+                            stepNum, CDbl(oa((stepNum-1)*3+2)), CDbl(oa((stepNum-1)*3+2)) / 1000000.0))
+                    End If
+                Catch ex As Exception
+                    Log("    FAILED: " & ex.Message)
+                End Try
 
-                ' 3. DispAllSteps for ID edge node -- which slot is UY=10mm at step 13?
-                If idNode > 0 Then
-                    Try
-                        Dim st As Integer = 0
-                        Dim oa() As Object = DirectCast( _
-                            results.GetDisplacementComponentForAllStepsAtNode(2, idNode, Nothing, 0, st), Object())
-                        Dim last As Integer = (oa.Length \ 3) - 1
-                        Log(String.Format("DispAllSteps(idNode={0}) step13: [base+0]={1:F6} [base+1]={2:F6} [base+2]={3:F6}", _
-                            idNode, CDbl(oa(last*3)), CDbl(oa(last*3+1)), CDbl(oa(last*3+2))))
-                        Log("  (one of these should be close to 10mm = prescribed UY at step13)")
-                        ' Also check step 1
-                        Log(String.Format("  step1: [base+0]={0:F6} [base+1]={1:F6} [base+2]={2:F6}", _
-                            CDbl(oa(0)), CDbl(oa(1)), CDbl(oa(2))))
-                    Catch ex As Exception : Log("DispAllSteps idNode err: " & ex.Message) : End Try
-                End If
-
-                ' 4. React Fy for OD edge nodes (compare to ID edge sum)
-                If _odEdge IsNot Nothing Then
-                    Try
-                        Dim st As Integer = 0
-                        Dim eArr() As Object = New Object() {DirectCast(_odEdge, Object)}
-                        Dim dispOa() As Object = DirectCast(results.GetDisplacementForEntities(2, 13, Nothing, eArr, 0, st), Object())
-                        Dim odNodeIDs As New List(Of Integer)()
-                        For i As Integer = 0 To dispOa.Length - 1 Step 2
-                            odNodeIDs.Add(CInt(dispOa(i)))
-                        Next
-                        Log(String.Format("OD edge nodes: {0}", odNodeIDs.Count))
-                        ' Build react index map from step 1
-                        Dim reactOa() As Object = DirectCast(results.GetReactionForcesAndMoments(13, Nothing, 0, st), Object())
-                        Dim idxMap As New Dictionary(Of Integer, Integer)()
-                        Dim stride As Integer = 9
-                        For i As Integer = 0 To (reactOa.Length \ stride) - 1
-                            idxMap(CInt(reactOa(i*stride))) = i
-                            If i Mod 500 = 0 Then System.Windows.Forms.Application.DoEvents()
-                        Next
-                        ' Sum Fy (idx+2) for OD nodes
-                        Dim sumOD As Double = 0
-                        For Each nid As Integer In odNodeIDs
-                            If idxMap.ContainsKey(nid) Then
-                                sumOD += CDbl(reactOa(idxMap(nid)*stride + 2))
-                            End If
-                        Next
-                        Log(String.Format("OD Fy sum at step13: {0:F4}N  |sum|={1:F4}N", sumOD, Math.Abs(sumOD)))
-                        Log("  (compare to ID Fy sum=0.8663N from last run)")
-                    Catch ex As Exception : Log("OD react err: " & ex.Message) : End Try
-                End If
-
-                Log("Done")
+                Log("========================================")
+                Log("  PROBE COMPLETE")
+                Log("========================================")
             Catch ex As System.Exception
-                Log("ERROR: " & ex.Message)
+                Log("PROBE ERROR: " & ex.Message)
             End Try
         End Sub
 
@@ -1512,6 +1584,8 @@ Imports SolidWorks.Interop.cosworks
                 Log("  Building node map...")
                 Dim nodeR As New Dictionary(Of Integer, Double)()
                 Dim nodeY As New Dictionary(Of Integer, Double)()
+                Dim nodeX As New Dictionary(Of Integer, Double)()
+                Dim nodeZ As New Dictionary(Of Integer, Double)()
                 Dim coordScale As Double = 1.0
                 Try
                     Dim oa() As Object = DirectCast(CallByName(mo, "GetNodes", CallType.Method), Object())
@@ -1526,6 +1600,8 @@ Imports SolidWorks.Interop.cosworks
                         Dim nx As Double = CDbl(oa(b+1)), ny As Double = CDbl(oa(b+2)), nz As Double = CDbl(oa(b+3))
                         nodeR(nid) = Math.Sqrt(nx*nx + nz*nz) * coordScale
                         nodeY(nid) = ny * coordScale
+                        nodeX(nid) = nx * coordScale
+                        nodeZ(nid) = nz * coordScale
                         If i Mod 500 = 0 Then System.Windows.Forms.Application.DoEvents()
                     Next
                     Log(String.Format("  Node map: {0} entries", nodeR.Count))
@@ -1648,18 +1724,88 @@ Imports SolidWorks.Interop.cosworks
                 Log(String.Format("  F_reaction: step1={0:F4}N step13={1:F4}N  Kms_secant={2:F4}N/mm", _
                     fReact(0), fReact(stepCount-1), fReact(stepCount-1)/maxDisp_mm))
 
-                ' ─── Phase 5: Write CSV ───
+                ' ─── Phase 4.5: Tier 3 via GetMinMaxStress (one call per step) ───────
+                ' Fast path: ~50 calls total. <1 second on a 10k-node mesh.
+                Log("  Phase 4.5: GetMinMaxStress per step (Tier 3)...")
+                Dim stressOK As Boolean = False
+                Dim vmMax(stepCount - 1) As Double
+                Dim vmMaxR(stepCount - 1) As Double
+                Dim vmMaxZ(stepCount - 1) As Double
+                Dim vmMaxNodeID(stepCount - 1) As Integer
+
+                ' One-time slot-order detection: the [0]/[2] slots hold node IDs,
+                ' and we need to know which is the MAX node. Cross-check the slot-[2]
+                ' candidate against the per-node API.
+                Dim maxNodeSlot As Integer = 2  ' default guess: [minNid, minVal, maxNid, maxVal]
+                Try
+                    Dim sx As Integer = 0
+                    Dim oa() As Object = DirectCast( _
+                        results.GetMinMaxStress(9, -1, 1, Nothing, 0, sx), Object())
+                    If oa.Length >= 4 Then
+                        Dim maxValAtStep1 As Double = CDbl(oa(3))
+                        Dim cand2 As Integer = CInt(oa(2))
+                        ' Look up stress at cand2 via per-node API at step 1
+                        Dim sx2 As Integer = 0
+                        Dim sv() As Object = DirectCast( _
+                            results.GetStressComponentForAllStepsAtNode(9, cand2, Nothing, 0, sx2), Object())
+                        Dim valAtCand2 As Double = CDbl(sv(2))  ' step 1 value
+                        Dim rel As Double = Math.Abs(valAtCand2 - maxValAtStep1) / Math.Max(1.0e-9, Math.Abs(maxValAtStep1))
+                        maxNodeSlot = If(rel < 0.05, 2, 0)
+                        Log(String.Format("    Slot detect: cand2 stress={0:E3}  maxVal={1:E3}  rel={2:F4}  -> slot=[{3}]", _
+                            valAtCand2, maxValAtStep1, rel, maxNodeSlot))
+                        stressOK = True
+                    Else
+                        Log(String.Format("    Slot detect: unexpected GetMinMaxStress length {0}", oa.Length))
+                    End If
+                Catch ex As Exception
+                    Log("    Slot detect FAILED: " & ex.Message)
+                End Try
+
+                If stressOK Then
+                    Dim apiFailCount As Integer = 0
+                    For iStep As Integer = 0 To stepCount - 1
+                        Try
+                            Dim sx As Integer = 0
+                            Dim oa() As Object = DirectCast( _
+                                results.GetMinMaxStress(9, -1, iStep + 1, Nothing, 0, sx), Object())
+                            If oa.Length >= 4 Then
+                                vmMax(iStep) = CDbl(oa(3)) / 1000000.0  ' Pa -> MPa
+                                Dim maxNid As Integer = CInt(If(maxNodeSlot = 0, oa(0), oa(2)))
+                                vmMaxNodeID(iStep) = maxNid
+                                If maxNid > 0 AndAlso nodeR.ContainsKey(maxNid) Then
+                                    vmMaxR(iStep) = nodeR(maxNid)
+                                    vmMaxZ(iStep) = nodeY(maxNid)
+                                End If
+                            Else
+                                apiFailCount += 1
+                                vmMax(iStep) = Double.NaN
+                            End If
+                        Catch ex As Exception
+                            apiFailCount += 1
+                            vmMax(iStep) = Double.NaN
+                        End Try
+                    Next
+                    Log(String.Format("    Tier 3: step1={0:F3} MPa  midstep={1:F3} MPa  laststep={2:F3} MPa  (api fails: {3})", _
+                        vmMax(0), vmMax(stepCount \ 2), vmMax(stepCount - 1), apiFailCount))
+                    Log(String.Format("    Last-step max @ node {0} R={1:F2}mm Z={2:F2}mm", _
+                        vmMaxNodeID(stepCount - 1), vmMaxR(stepCount - 1), vmMaxZ(stepCount - 1)))
+                End If
+
+                ' ─── Phase 5: Write _auto.csv ───────────────────────────────────────
                 Dim sb As New System.Text.StringBuilder()
                 sb.Append("Step,Time_frac,X_applied_mm,F_reaction_N,Kms_N_per_mm")
                 For ci As Integer = 0 To crests.Count - 1
-                    sb.Append(String.Format(",Z_roll{0}_mm", ci+1))
+                    sb.Append(String.Format(",Z_roll{0}_mm", ci + 1))
                 Next
                 For ci As Integer = 0 To crests.Count - 1
-                    sb.Append(String.Format(",Ratio_roll{0}", ci+1))
+                    sb.Append(String.Format(",Ratio_roll{0}", ci + 1))
                 Next
+                If stressOK Then
+                    sb.Append(",vonMises_max_MPa,R_at_max_mm,Z_at_max_mm")
+                End If
                 sb.AppendLine()
-                sb.AppendLine(String.Format("# ID={0} OD={1} N={2} H_pp={3} T={4} E={5} Nu={6}", _
-                    profile.ID, profile.OD, profile.N, profile.H_pp, profile.T, profile.E, profile.Nu))
+                sb.AppendLine(String.Format("# ID={0} OD={1} N={2} H_pp={3} T={4} E={5} Nu={6} Density={7} Material={8}", _
+                    profile.ID, profile.OD, profile.N, profile.H_pp, profile.T, profile.E, profile.Nu, profile.Density, profile.MaterialName))
                 sb.AppendLine(String.Format("# Roll crests R (mm): " & String.Join(", ", _
                     crests.ConvertAll(Function(r) r.ToString("F2")).ToArray())))
                 sb.AppendLine(String.Format("# Crest node IDs: " & String.Join(", ", _
@@ -1668,14 +1814,17 @@ Imports SolidWorks.Interop.cosworks
                     Array.ConvertAll(crestNodeR, Function(r) r.ToString("F2")))))
                 sb.AppendLine(String.Format("# Crest node Y (mm): " & String.Join(", ", _
                     Array.ConvertAll(crestNodeY, Function(y) y.ToString("F2")))))
+                If stressOK Then
+                    sb.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Tier 3 = per-step global max via GetMinMaxStress)")
+                End If
 
                 For iStep As Integer = 0 To stepCount - 1
-                    Dim tf As Double = If(timeFracLoaded, timeFrac(iStep), CDbl(iStep+1)/CDbl(stepCount))
+                    Dim tf As Double = If(timeFracLoaded, timeFrac(iStep), CDbl(iStep + 1) / CDbl(stepCount))
                     Dim xApp As Double = tf * maxDisp_mm
                     Dim fStr As String = If(Double.IsNaN(fReact(iStep)), "", fReact(iStep).ToString("F6"))
                     Dim kStr As String = If(Double.IsNaN(fReact(iStep)) OrElse Math.Abs(xApp) < 0.001, "", _
                         (fReact(iStep) / xApp).ToString("F6"))
-                    sb.Append(String.Format("{0},{1:F6},{2:F6},{3},{4}", iStep+1, tf, xApp, fStr, kStr))
+                    sb.Append(String.Format("{0},{1:F6},{2:F6},{3},{4}", iStep + 1, tf, xApp, fStr, kStr))
                     For ci As Integer = 0 To crests.Count - 1
                         sb.Append(String.Format(",{0:F6}", crestUY(ci, iStep)))
                     Next
@@ -1683,11 +1832,187 @@ Imports SolidWorks.Interop.cosworks
                         Dim ratio As Double = If(Math.Abs(xApp) > 0.001, crestUY(ci, iStep) / xApp, 0.0)
                         sb.Append(String.Format(",{0:F6}", ratio))
                     Next
+                    If stressOK Then
+                        Dim vmStr As String = If(Double.IsNaN(vmMax(iStep)), "", vmMax(iStep).ToString("F4"))
+                        sb.Append(String.Format(",{0},{1:F4},{2:F4}", vmStr, vmMaxR(iStep), vmMaxZ(iStep)))
+                    End If
                     sb.AppendLine()
                 Next
 
                 System.IO.File.WriteAllText(outputPath, sb.ToString())
                 Log("  CSV: " & outputPath)
+
+                ' ─── Phase 6: _profile.csv (Tier 2 = 10 deciles, Tier 1 = stress at θ=0 slice) ───
+                Log("  Extracting profile cross-section...")
+                Try
+                    Dim angleTol As Double = 0.06
+                    Dim profileNodes As New List(Of Integer)()
+                    For Each kvp As KeyValuePair(Of Integer, Double) In nodeX
+                        Dim nid As Integer = kvp.Key
+                        Dim nx As Double = kvp.Value
+                        Dim nz As Double = nodeZ(nid)
+                        If nx > 0.1 Then
+                            Dim theta As Double = Math.Abs(Math.Atan2(nz, nx))
+                            If theta < angleTol Then profileNodes.Add(nid)
+                        End If
+                    Next
+                    If profileNodes.Count < 10 Then
+                        angleTol = 0.15
+                        profileNodes.Clear()
+                        For Each kvp As KeyValuePair(Of Integer, Double) In nodeX
+                            Dim nid As Integer = kvp.Key
+                            Dim nx As Double = kvp.Value
+                            Dim nz As Double = nodeZ(nid)
+                            If nx > 0.1 Then
+                                Dim theta As Double = Math.Abs(Math.Atan2(nz, nx))
+                                If theta < angleTol Then profileNodes.Add(nid)
+                            End If
+                        Next
+                    End If
+                    profileNodes.Sort(Function(a, b) nodeR(a).CompareTo(nodeR(b)))
+                    Log(String.Format("  Profile nodes: {0} (angle tol={1:F3} rad)", profileNodes.Count, angleTol))
+
+                    If profileNodes.Count >= 5 Then
+                        ' 10 decile excursion levels
+                        Dim targetFracs() As Double = {0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+                        Dim profileSteps(10) As Integer
+                        Dim profileDisp(10) As Double
+                        For ti As Integer = 0 To 10
+                            Dim targetStep As Integer = CInt(Math.Round(targetFracs(ti) * (stepCount - 1)))
+                            If targetStep < 0 Then targetStep = 0
+                            If targetStep >= stepCount Then targetStep = stepCount - 1
+                            profileSteps(ti) = targetStep
+                            Dim tf As Double = If(timeFracLoaded, timeFrac(targetStep), CDbl(targetStep + 1) / CDbl(stepCount))
+                            profileDisp(ti) = tf * maxDisp_mm
+                        Next
+                        profileSteps(0) = -1
+                        profileDisp(0) = 0.0
+
+                        Dim dispLevelsStr As String = profileDisp(1).ToString("F1")
+                        For ti As Integer = 2 To 10
+                            dispLevelsStr &= ", " & profileDisp(ti).ToString("F1")
+                        Next
+                        Log("  Excursion levels (mm): " & dispLevelsStr)
+
+                        ' Displacement extraction for profile nodes
+                        Dim profUX(profileNodes.Count - 1, stepCount - 1) As Double
+                        Dim profUY(profileNodes.Count - 1, stepCount - 1) As Double
+                        For pi As Integer = 0 To profileNodes.Count - 1
+                            Dim nid As Integer = profileNodes(pi)
+                            Try
+                                Dim stx As Integer = 0
+                                Dim oax() As Object = DirectCast( _
+                                    results.GetDisplacementComponentForAllStepsAtNode(0, nid, Nothing, 0, stx), Object())
+                                For iStep As Integer = 0 To stepCount - 1
+                                    Dim bx As Integer = iStep * 3
+                                    If bx + 2 < oax.Length Then profUX(pi, iStep) = CDbl(oax(bx + 2))
+                                Next
+                                Dim sty As Integer = 0
+                                Dim oay() As Object = DirectCast( _
+                                    results.GetDisplacementComponentForAllStepsAtNode(1, nid, Nothing, 0, sty), Object())
+                                For iStep As Integer = 0 To stepCount - 1
+                                    Dim by As Integer = iStep * 3
+                                    If by + 2 < oay.Length Then profUY(pi, iStep) = CDbl(oay(by + 2))
+                                Next
+                            Catch ex As Exception
+                            End Try
+                            If pi Mod 20 = 0 Then System.Windows.Forms.Application.DoEvents()
+                        Next
+                        Log("  Profile displacement extraction complete")
+
+                        ' Tier 1 stress for profile nodes only (per-node API, ~200 calls)
+                        Dim profStress(profileNodes.Count - 1, stepCount - 1) As Double  ' MPa
+                        Dim profStressOK As Boolean = False
+                        If stressOK Then
+                            Log(String.Format("  Tier 1: extracting stress for {0} profile nodes...", profileNodes.Count))
+                            Dim t0 As DateTime = DateTime.Now
+                            Dim sFails As Integer = 0
+                            For pi As Integer = 0 To profileNodes.Count - 1
+                                Dim nid As Integer = profileNodes(pi)
+                                Try
+                                    Dim sts As Integer = 0
+                                    Dim oas() As Object = DirectCast( _
+                                        results.GetStressComponentForAllStepsAtNode(9, nid, Nothing, 0, sts), Object())
+                                    For iStep As Integer = 0 To stepCount - 1
+                                        Dim bs As Integer = iStep * 3
+                                        If bs + 2 < oas.Length Then
+                                            profStress(pi, iStep) = CDbl(oas(bs + 2)) / 1000000.0  ' Pa -> MPa
+                                        End If
+                                    Next
+                                Catch ex As Exception
+                                    sFails += 1
+                                End Try
+                                System.Windows.Forms.Application.DoEvents()
+                            Next
+                            profStressOK = (sFails < profileNodes.Count)
+                            Log(String.Format("  Tier 1 done in {0:F1}s ({1} failures)", _
+                                (DateTime.Now - t0).TotalSeconds, sFails))
+                        End If
+
+                        ' Build _profile.csv
+                        Dim sbProf As New System.Text.StringBuilder()
+                        sbProf.Append("NodeID,R_undef_mm,Z_undef_mm")
+                        For ti As Integer = 1 To 10
+                            Dim dLabel As String = profileDisp(ti).ToString("F1").Replace(".", "_")
+                            sbProf.Append(String.Format(",R_at_{0}mm,Z_at_{0}mm", dLabel))
+                        Next
+                        If profStressOK Then
+                            sbProf.Append(",Stress_undef_MPa")
+                            For ti As Integer = 1 To 10
+                                Dim dLabel As String = profileDisp(ti).ToString("F1").Replace(".", "_")
+                                sbProf.Append(String.Format(",Stress_at_{0}_MPa", dLabel))
+                            Next
+                        End If
+                        sbProf.AppendLine()
+
+                        sbProf.AppendLine(String.Format("# ID={0} OD={1} N={2} H_pp={3} T={4} E={5} Nu={6} Density={7} Material={8}", _
+                            profile.ID, profile.OD, profile.N, profile.H_pp, profile.T, profile.E, profile.Nu, profile.Density, profile.MaterialName))
+                        sbProf.AppendLine(String.Format("# Profile nodes: {0}  Angle tolerance: {1:F3} rad", profileNodes.Count, angleTol))
+                        Dim excursionStr As String = profileDisp(1).ToString("F1")
+                        For ti As Integer = 2 To 10
+                            excursionStr &= ", " & profileDisp(ti).ToString("F1")
+                        Next
+                        sbProf.AppendLine("# Excursion levels (mm): " & excursionStr)
+                        Dim stepStr As String = (profileSteps(1) + 1).ToString()
+                        For ti As Integer = 2 To 10
+                            stepStr &= ", " & (profileSteps(ti) + 1).ToString()
+                        Next
+                        sbProf.AppendLine("# Steps used: " & stepStr)
+                        If profStressOK Then
+                            sbProf.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Tier 1)")
+                        End If
+
+                        For pi As Integer = 0 To profileNodes.Count - 1
+                            Dim nid As Integer = profileNodes(pi)
+                            Dim rUndef As Double = nodeR(nid)
+                            Dim zUndef As Double = nodeY(nid)
+                            sbProf.Append(String.Format("{0},{1:F4},{2:F4}", nid, rUndef, zUndef))
+                            For ti As Integer = 1 To 10
+                                Dim si As Integer = profileSteps(ti)
+                                Dim rDef As Double = rUndef + profUX(pi, si)
+                                Dim zDef As Double = zUndef + profUY(pi, si)
+                                sbProf.Append(String.Format(",{0:F4},{1:F4}", rDef, zDef))
+                            Next
+                            If profStressOK Then
+                                sbProf.Append(",0.0000")
+                                For ti As Integer = 1 To 10
+                                    Dim si As Integer = profileSteps(ti)
+                                    sbProf.Append(String.Format(",{0:F4}", profStress(pi, si)))
+                                Next
+                            End If
+                            sbProf.AppendLine()
+                        Next
+
+                        Dim profPath As String = outputPath.Replace("_auto.csv", "_profile.csv")
+                        System.IO.File.WriteAllText(profPath, sbProf.ToString())
+                        Log("  Profile CSV: " & profPath)
+                    Else
+                        Log("  WARNING: Too few profile nodes found — skipping profile extraction")
+                    End If
+                Catch ex As Exception
+                    Log("  Profile extraction failed: " & ex.Message)
+                End Try
+
                 Log("=== ExtractResultsAuto complete ===")
                 Return True
             Catch ex As System.Exception

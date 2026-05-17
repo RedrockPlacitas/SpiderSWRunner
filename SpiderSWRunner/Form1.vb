@@ -12,6 +12,9 @@ Imports Microsoft.VisualBasic
             InitializeComponent()
             _sw = New SWAutomation(AddressOf LogMessage)
 
+            ' Default to Edge mode
+            cbMode.SelectedIndex = 1
+
             ' Banner
             LogMessage("Spider / Edge -> SolidWorks Runner ready.")
             LogMessage("Workflow: Connect -> Create Part -> Setup Study -> Mesh+Run -> Extract")
@@ -25,19 +28,39 @@ Imports Microsoft.VisualBasic
                 Case 1 : Return "Arc"
                 Case 2 : Return "ArcLines"
                 Case 3 : Return "SineLines"
-                Case 10 : Return "HalfRoll"
+                Case 10
+                    If p.FirstRollUp Then
+                        Return "HalfRoll"
+                    Else
+                        Return "InvRoll"
+                    End If
                 Case 11 : Return "DoubleRoll"
                 Case 12 : Return "Bullet"
+                Case 13 : Return "Flat"
+                Case 14 : Return "Triangle"
+                Case 16 : Return "LipRoll"
+                Case 17 : Return "TriRadius"
                 Case 99 : Return "COMSOL"
                 Case Else : Return "Sin"
             End Select
         End Function
 
+        ''' <summary>
+        ''' Returns True if Pull (-Y) is selected, False for Push (+Y).
+        ''' </summary>
+        Private Function IsPullDirection() As Boolean
+            If cbDirection IsNot Nothing Then
+                Return (cbDirection.SelectedIndex = 1)
+            End If
+            Return False
+        End Function
+
         Private Function BuildOutputFilename(p As SpiderProfile) As String
             Dim modeStr As String = If(p.ComponentMode = 1, "Edge", "Spider")
             Dim tag As String = ProfileTag(p)
-            Dim base As String = String.Format("{0}_N{1}_ID{2}_OD{3}_{4}_Hpp{5:F1}_T{6:F1}_E{7:F1}_Nu{8:F2}", _
-                modeStr, p.N, CInt(p.ID), CInt(p.OD), tag, p.H_pp, p.T, p.E, p.Nu)
+            Dim matTag As String = p.MaterialName.Replace(" ", "_")
+            Dim base As String = String.Format("{0}_N{1}_ID{2}_OD{3}_{4}_Hpp{5:F1}_T{6:F2}_{7}", _
+                modeStr, p.N, CInt(p.ID), CInt(p.OD), tag, p.H_pp, p.T, matTag)
             ' Add angle suffix for ArcLines/SineLines
             If p.ProfileType = 2 OrElse p.ProfileType = 3 Then
                 base = base & String.Format("_A{0}", CInt(p.ConnectorAngle))
@@ -53,6 +76,16 @@ Imports Microsoft.VisualBasic
             ' Add natural H marker
             If p.UseNaturalH Then
                 base = base & "_natH"
+            End If
+            ' Add First-Down marker (First-Up is default, no tag)
+            If Not p.FirstRollUp Then
+                base = base & "_FD"
+            End If
+            ' Add direction suffix
+            If IsPullDirection() Then
+                base = base & "_Pull"
+            Else
+                base = base & "_Push"
             End If
             base = base & "_auto.csv"
             Return base
@@ -76,7 +109,7 @@ Imports Microsoft.VisualBasic
 
         ''' <summary>
         ''' Map the profile combo's selected index to a ProfileType integer.
-        ''' Spider mode: 0=Sinusoidal, 1=CircularArc, 2=ArcLines, 3=SineLines
+        ''' Spider mode: 0=Sinusoidal, 1=CircularArc, 2=ArcLines, 3=SineLines, 4=Triangle(Accordion)
         ''' Edge mode:   10=HalfRoll, 11=DoubleRoll, 12=Bullet, then 0,1,2,3
         ''' </summary>
         Private Function ProfileTypeFromCombo() As Integer
@@ -86,12 +119,10 @@ Imports Microsoft.VisualBasic
             If isEdge Then
                 Select Case idx
                     Case 0 : Return 10  ' Half Roll
-                    Case 1 : Return 11  ' Double Roll
-                    Case 2 : Return 12  ' Bullet
-                    Case 3 : Return 0   ' Sinusoidal
-                    Case 4 : Return 1   ' Circular Arc
-                    Case 5 : Return 2   ' Arc+Lines
-                    Case 6 : Return 3   ' Sine+Lines
+                    Case 1 : Return 10  ' Inverted Roll (same type, auto-flip direction)
+                    Case 2 : Return 13  ' Flat / Cloth
+                    Case 3 : Return 14  ' Accordion
+                    Case 4 : Return 17  ' Tri-Radius
                     Case Else : Return 10
                 End Select
             Else
@@ -100,6 +131,7 @@ Imports Microsoft.VisualBasic
                     Case 1 : Return 1   ' Circular Arc
                     Case 2 : Return 2   ' Arc+Lines
                     Case 3 : Return 3   ' Sine+Lines
+                    Case 4 : Return 14  ' Triangle (Accordion)
                     Case Else : Return 0
                 End Select
             End If
@@ -152,11 +184,17 @@ Imports Microsoft.VisualBasic
             If tbBulletRod IsNot Nothing Then
                 p.InnerLipWidth = D(tbBulletRod, 5.0)
             End If
+            ' Edge mode: override InnerLipWidth from dedicated control
+            If tbInnerLip IsNot Nothing AndAlso tbInnerLip.Visible Then
+                p.InnerLipWidth = D(tbInnerLip, 5.0)
+            End If
 
             ' Force N for edge arc profiles
             If p.ProfileType = 10 Then p.N = 1
-            If p.ProfileType = 11 Then p.N = 2
             If p.ProfileType = 12 Then p.N = 1
+            If p.ProfileType = 13 Then p.N = 1
+            ' ProfileType 14 (Accordion): N = user-specified pleat count
+            If p.ProfileType = 17 Then p.N = 1
 
             ' FEA calibration controls
             If tbTaperPct IsNot Nothing Then
@@ -206,17 +244,37 @@ Imports Microsoft.VisualBasic
                 ' Swap profile combo to edge types
                 cbProfile.Items.Clear()
                 cbProfile.Items.AddRange(New Object() { _
-                    "Half Roll", "Double Roll", "Bullet", "Sinusoidal", "Circular Arc", "Arc+Lines", "Sine+Lines"})
+                    "Half Roll", "Inverted Roll", "Flat / Cloth", _
+                    "Triangle", "Tri-Radius"})
                 cbProfile.SelectedIndex = 0
 
-                ' Edge defaults
-                tbID.Text = "100"
-                tbOD.Text = "120"
+                ' Edge defaults (Phase 1 HalfRoll matrix geometry)
+                tbID.Text = "148"
+                tbOD.Text = "207"
                 tbN.Text = "1"
-                tbHpp.Text = "5.0"
-                tbT.Text = "0.5"
+                tbHpp.Text = "29.5"
+                tbT.Text = "0.80"
                 tbLipWidth.Text = "3.0"
-                tbMaxDisp.Text = "10"
+                tbMaxDisp.Text = "20"
+
+                ' Edge output directory
+                tbOutputDir.Text = "C:\SpiderSW_Results\Edge"
+
+                ' Default to NBR_SBR_rubber (first edge matrix material)
+                cbMaterial.SelectedIndex = 2
+
+                ' Relabel Lip for edge mode
+                If lblLipWidth IsNot Nothing Then lblLipWidth.Text = "Outer Lip:"
+
+                ' Show Inner Lip (at T's position), move T down to First Roll row
+                If lblInnerLip IsNot Nothing Then
+                    lblInnerLip.Visible = True
+                    tbInnerLip.Visible = True
+                End If
+                If lblT IsNot Nothing Then
+                    lblT.Location = New System.Drawing.Point(170, 104 + 3)
+                    tbT.Location = New System.Drawing.Point(250, 104)
+                End If
 
                 ' Hide COMSOL checkbox (not relevant for edges)
                 chkCOMSOL.Visible = False
@@ -239,10 +297,10 @@ Imports Microsoft.VisualBasic
                 ' Swap profile combo to spider types
                 cbProfile.Items.Clear()
                 cbProfile.Items.AddRange(New Object() { _
-                    "Sinusoidal", "Circular Arc", "Arc+Lines", "Sine+Lines"})
+                    "Sinusoidal", "Circular Arc", "Arc+Lines", "Sine+Lines", "Triangle"})
                 cbProfile.SelectedIndex = 0
 
-                ' Spider defaults
+                ' Spider defaults (Asymmetry campaign geometry)
                 tbID.Text = "67"
                 tbOD.Text = "172"
                 tbN.Text = "7"
@@ -250,6 +308,25 @@ Imports Microsoft.VisualBasic
                 tbT.Text = "0.8"
                 tbLipWidth.Text = "5.0"
                 tbMaxDisp.Text = "35"
+
+                ' Spider output directory
+                tbOutputDir.Text = "C:\SpiderSW_Results\Spider_Asymmetry"
+
+                ' Default to Rubber for spider asymmetry campaign
+                cbMaterial.SelectedIndex = 0
+
+                ' Restore Lip label for spider mode
+                If lblLipWidth IsNot Nothing Then lblLipWidth.Text = "Lip (mm):"
+
+                ' Hide Inner Lip, restore T to normal position
+                If lblInnerLip IsNot Nothing Then
+                    lblInnerLip.Visible = False
+                    tbInnerLip.Visible = False
+                End If
+                If lblT IsNot Nothing Then
+                    lblT.Location = New System.Drawing.Point(170, 76 + 3)
+                    tbT.Location = New System.Drawing.Point(250, 76)
+                End If
 
                 ' Show COMSOL checkbox
                 chkCOMSOL.Visible = True
@@ -281,40 +358,65 @@ Imports Microsoft.VisualBasic
         Private Sub UpdateEdgeProfileControls()
             If cbMode Is Nothing OrElse cbMode.SelectedIndex <> 1 Then Return
             Dim pt As Integer = ProfileTypeFromCombo()
+            Dim comboIdx As Integer = cbProfile.SelectedIndex
 
-            ' CenterFlat only for DoubleRoll
-            lblCenterFlat.Visible = (pt = 11)
-            tbCenterFlat.Visible = (pt = 11)
+            ' Inverted Roll (combo index 1): auto-set FirstRoll to Down
+            ' Half Roll (combo index 0): auto-set FirstRoll to Up
+            If comboIdx = 1 Then
+                cbFirstRoll.SelectedIndex = 1  ' Down
+            ElseIf comboIdx = 0 Then
+                cbFirstRoll.SelectedIndex = 0  ' Up
+            End If
 
-            ' Bullet Cx and R2 only for Bullet
-            lblBulletRid.Visible = (pt = 12)
-            tbBulletRid.Visible = (pt = 12)
-            lblBulletRtop.Visible = (pt = 12)
-            tbBulletRtop.Visible = (pt = 12)
+            ' CenterFlat: not used (Double Roll removed)
+            lblCenterFlat.Visible = False
+            tbCenterFlat.Visible = False
 
-            ' InnerLipWidth (tbBulletRod) for all edge types (HalfRoll, DoubleRoll, Bullet)
-            Dim showInnerLip As Boolean = (pt = 10 OrElse pt = 11 OrElse pt = 12)
-            lblBulletRod.Visible = showInnerLip
-            tbBulletRod.Visible = showInnerLip
-            If showInnerLip Then
-                lblBulletRod.Text = "InnerLip"
-                tbBulletRod.ReadOnly = False
-                If String.IsNullOrWhiteSpace(tbBulletRod.Text) OrElse tbBulletRod.Text.Contains("/") Then
-                    tbBulletRod.Text = "5.0"
+            ' Tri-Radius: show R2 Rad and R2 Ctr next to Profile combo
+            Dim isTriRadius As Boolean = (pt = 17)
+            lblBulletRid.Visible = isTriRadius
+            tbBulletRid.Visible = isTriRadius
+            lblBulletRtop.Visible = isTriRadius
+            tbBulletRtop.Visible = isTriRadius
+            If isTriRadius Then
+                lblBulletRid.Text = "R2 Rad:"
+                lblBulletRtop.Text = "R2 Ctr:"
+                ' Reposition next to Profile combo (where ConnAngle normally sits)
+                ' Profile combo is at (70, yRow), so these go right of it
+                Dim yRow As Integer = cbProfile.Location.Y
+                lblBulletRid.Location = New System.Drawing.Point(205, yRow + 3)
+                tbBulletRid.Location = New System.Drawing.Point(260, yRow)
+                tbBulletRid.Size = New System.Drawing.Size(55, 23)
+                lblBulletRtop.Location = New System.Drawing.Point(320, yRow + 3)
+                tbBulletRtop.Location = New System.Drawing.Point(370, yRow)
+                tbBulletRtop.Size = New System.Drawing.Size(55, 23)
+                ' Seed with working defaults matching template
+                If tbBulletRid.Text = "0" OrElse String.IsNullOrWhiteSpace(tbBulletRid.Text) Then
+                    tbBulletRid.Text = "3.0"
+                End If
+                If tbBulletRtop.Text = "3.0" OrElse tbBulletRtop.Text = "5.0" OrElse String.IsNullOrWhiteSpace(tbBulletRtop.Text) Then
+                    ' Default R2 Center to midpoint of Cone/Basket radii
+                    Dim rInner As Double = D(tbID, 100.0) / 2.0
+                    Dim rOuter As Double = D(tbOD, 120.0) / 2.0
+                    tbBulletRtop.Text = String.Format("{0:F1}", (rInner + rOuter) / 2.0)
                 End If
             End If
 
-            ' ConnectorAngle/StraightLen for ArcLines/SineLines
-            Dim showConn As Boolean = (pt = 2 OrElse pt = 3)
-            lblConnAngle.Visible = showConn
-            tbConnAngle.Visible = showConn
-            lblStraightLen.Visible = showConn
-            tbStraightLen.Visible = showConn
+            ' tbBulletRod: not used for current edge types (R1/R3 are SW-driven for TriRadius)
+            lblBulletRod.Visible = False
+            tbBulletRod.Visible = False
 
-            ' N is forced for HalfRoll/DoubleRoll/Bullet
+            ' ConnectorAngle/StraightLen: not used for edge types
+            lblConnAngle.Visible = False
+            tbConnAngle.Visible = False
+            lblStraightLen.Visible = False
+            tbStraightLen.Visible = False
+
+            ' N forcing — most edge types force N
             If pt = 10 Then tbN.Text = "1"
-            If pt = 11 Then tbN.Text = "2"
-            If pt = 12 Then tbN.Text = "1"
+            If pt = 13 Then tbN.Text = "1"
+            ' Accordion (14): leave N as user-specified
+            If pt = 17 Then tbN.Text = "1"
         End Sub
 
         Private Sub cbProfile_SelectedIndexChanged(ByVal sender As Object, ByVal e As EventArgs) _
@@ -335,10 +437,26 @@ Imports Microsoft.VisualBasic
             Select Case cbMaterial.SelectedIndex
                 Case 0  ' Rubber
                     tbE.Text = "6.1" : tbNu.Text = "0.49" : tbDensity.Text = "1000"
-                Case 1  ' Cotton Cloth
-                    tbE.Text = "3000" : tbNu.Text = "0.30" : tbDensity.Text = "1200"
-                Case 2  ' Nomex
+                Case 1  ' Nomex
                     tbE.Text = "8000" : tbNu.Text = "0.28" : tbDensity.Text = "1100"
+                Case 2  ' NBR_SBR_rubber
+                    tbE.Text = "12" : tbNu.Text = "0.47" : tbDensity.Text = "1100"
+                Case 3  ' Polyester_foam
+                    tbE.Text = "3" : tbNu.Text = "0.20" : tbDensity.Text = "200"
+                Case 4  ' Cloth_spider
+                    tbE.Text = "89" : tbNu.Text = "0.30" : tbDensity.Text = "660"
+                Case 5  ' Cloth_A_PolyCotton
+                    tbE.Text = "600" : tbNu.Text = "0.30" : tbDensity.Text = "1320"
+                Case 6  ' Cloth_B_CottonPoly
+                    tbE.Text = "900" : tbNu.Text = "0.30" : tbDensity.Text = "1340"
+                Case 7  ' Cloth_C_Isotropic
+                    tbE.Text = "750" : tbNu.Text = "0.30" : tbDensity.Text = "1350"
+                Case 8  ' Cloth_D_SoftCotton
+                    tbE.Text = "500" : tbNu.Text = "0.20" : tbDensity.Text = "1280"
+                Case 9  ' Cloth_E_Aramid
+                    tbE.Text = "1500" : tbNu.Text = "0.25" : tbDensity.Text = "1390"
+                Case 10  ' Bimax_DKM
+                    tbE.Text = "1200" : tbNu.Text = "0.30" : tbDensity.Text = "1100"
             End Select
         End Sub
 
@@ -408,6 +526,9 @@ Imports Microsoft.VisualBasic
             Dim p = BuildProfile()
             Dim maxD As Double = D(tbMaxDisp, 10.0)
             Dim steps As Integer = I(tbSteps, 20)
+            If IsPullDirection() Then
+                LogMessage("*** PULL (-Y) selected. After Setup, check 'Reverse direction' on the prescribed displacement in the SW study tree. ***")
+            End If
             MarkButton(btnSetupStudy, _sw.SetupStudy(p, maxD, steps))
             Cursor = Cursors.Default
         End Sub
@@ -507,6 +628,23 @@ Imports Microsoft.VisualBasic
             txtLog.Clear()
         End Sub
 
+        Private Sub btnProbeStress_Click(ByVal sender As Object, ByVal e As EventArgs) _
+            Handles btnProbeStress.Click
+            ' ─────────────────────────────────────────────────────────
+            ' Runs SWAutomation.EnumerateResults — probes for batch stress API.
+            ' Requires: SW open, part loaded, study solved, ID/OD in GUI match
+            ' the open part. No files written. Logs only.
+            ' ─────────────────────────────────────────────────────────
+            Cursor = Cursors.WaitCursor
+            Try
+                Dim p = BuildProfile()
+                _sw.EnumerateResults(p)
+            Catch ex As System.Exception
+                LogMessage("ERROR: " & ex.Message)
+            End Try
+            Cursor = Cursors.Default
+        End Sub
+
         ' ══════════════════════════════════════
         '  CALIBRATION CONTROL EVENTS
         ' ══════════════════════════════════════
@@ -529,7 +667,7 @@ Imports Microsoft.VisualBasic
                     cbFirstRoll.SelectedIndexChanged, _
                     tbBulletRid.TextChanged, tbBulletRtop.TextChanged, tbBulletRod.TextChanged, _
                     tbTaperPct.TextChanged, tbPitchTaperPct.TextChanged, _
-                    chkUseNaturalH.CheckedChanged
+                    chkUseNaturalH.CheckedChanged, tbInnerLip.TextChanged
             UpdateComputed()
         End Sub
 

@@ -57,14 +57,20 @@
 
             AddLabel(grpGeometry, "N rolls:", c1, gy)
             tbN = AddTextBox(grpGeometry, "7", c2, gy, 55)
-            AddLabel(grpGeometry, "Lip (mm):", c3, gy)
+            lblLipWidth = AddLabelCtrl(grpGeometry, "Lip (mm):", c3, gy)
             tbLipWidth = AddTextBox(grpGeometry, "5.0", c4, gy, 55)
             gy += 28
 
             AddLabel(grpGeometry, "H_pp (mm):", c1, gy)
             tbHpp = AddTextBox(grpGeometry, "7.4", c2, gy, 55)
-            AddLabel(grpGeometry, "T (mm):", c3, gy)
+            lblT = AddLabelCtrl(grpGeometry, "T (mm):", c3, gy)
             tbT = AddTextBox(grpGeometry, "0.8", c4, gy, 55)
+
+            ' Inner Lip: overlaps T position, hidden by default (edge mode only)
+            lblInnerLip = AddLabelCtrl(grpGeometry, "Inner Lip:", c3, gy)
+            tbInnerLip = AddTextBox(grpGeometry, "5.0", c4, gy, 55)
+            lblInnerLip.Visible = False
+            tbInnerLip.Visible = False
             gy += 28
 
             AddLabel(grpGeometry, "First roll:", c1, gy)
@@ -96,7 +102,7 @@
             AddLabel(grpMaterial, "Preset:", 10, my)
             cbMaterial = New System.Windows.Forms.ComboBox()
             cbMaterial.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList
-            cbMaterial.Items.AddRange(New String() {"Rubber", "Cotton Cloth", "Nomex"})
+            cbMaterial.Items.AddRange(New String() {"Rubber", "Nomex", "NBR_SBR_rubber", "Polyester_foam", "Cloth_spider", "Cloth_A_PolyCotton", "Cloth_B_CottonPoly", "Cloth_C_Isotropic", "Cloth_D_SoftCotton", "Cloth_E_Aramid", "Bimax_DKM"})
             cbMaterial.SelectedIndex = 0
             cbMaterial.Location = New System.Drawing.Point(70, my)
             cbMaterial.Size = New System.Drawing.Size(120, 21)
@@ -123,6 +129,14 @@
             Dim sy As Integer = 20
             AddLabel(grpSim, "Max disp (mm):", 10, sy)
             tbMaxDisp = AddTextBox(grpSim, "35", 120, sy, 55)
+            AddLabel(grpSim, "Dir:", 185, sy)
+            cbDirection = New System.Windows.Forms.ComboBox()
+            cbDirection.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList
+            cbDirection.Items.AddRange(New String() {"Push (+Y)", "Pull (-Y)"})
+            cbDirection.SelectedIndex = 0
+            cbDirection.Location = New System.Drawing.Point(215, sy)
+            cbDirection.Size = New System.Drawing.Size(120, 21)
+            grpSim.Controls.Add(cbDirection)
             sy += 28
             AddLabel(grpSim, "Load steps:", 10, sy)
             tbSteps = AddTextBox(grpSim, "40", 120, sy, 55)
@@ -179,6 +193,11 @@
             btnClearLog = AddButton("Clear Log", 8 + bw + gap, yPos, 80, bh)
             btnRunAll = AddButton("Run All (1-5)", 8 + (bw + gap) * 2, yPos, bw, bh)
             btnRunAll.BackColor = System.Drawing.Color.FromArgb(220, 230, 255)
+
+            ' ── Row 3: diagnostic ──
+            yPos += bh + 4
+            btnProbeStress = AddButton("Probe Stress API", 8, yPos, bw + 30, bh)
+            btnProbeStress.BackColor = System.Drawing.Color.FromArgb(255, 230, 200)
 
             ' COMSOL profile checkbox
             chkCOMSOL = New System.Windows.Forms.CheckBox()
@@ -273,8 +292,12 @@
         Friend WithEvents tbOD As System.Windows.Forms.TextBox
         Friend WithEvents tbN As System.Windows.Forms.TextBox
         Friend WithEvents tbLipWidth As System.Windows.Forms.TextBox
+        Friend WithEvents lblLipWidth As System.Windows.Forms.Label
         Friend WithEvents tbHpp As System.Windows.Forms.TextBox
         Friend WithEvents tbT As System.Windows.Forms.TextBox
+        Friend WithEvents lblT As System.Windows.Forms.Label
+        Friend WithEvents lblInnerLip As System.Windows.Forms.Label
+        Friend WithEvents tbInnerLip As System.Windows.Forms.TextBox
         Friend WithEvents cbFirstRoll As System.Windows.Forms.ComboBox
         Friend WithEvents cbMaterial As System.Windows.Forms.ComboBox
         Friend WithEvents lblEffPitch As System.Windows.Forms.Label
@@ -284,6 +307,7 @@
         Friend WithEvents tbMaxDisp As System.Windows.Forms.TextBox
         Friend WithEvents tbSteps As System.Windows.Forms.TextBox
         Friend WithEvents tbOutputDir As System.Windows.Forms.TextBox
+        Friend WithEvents cbDirection As System.Windows.Forms.ComboBox
         Friend WithEvents tbTaperPct As System.Windows.Forms.TextBox
         Friend WithEvents tbPitchTaperPct As System.Windows.Forms.TextBox
         Friend WithEvents chkVariablePitch As System.Windows.Forms.CheckBox
@@ -296,6 +320,7 @@
         Friend WithEvents btnExportProfile As System.Windows.Forms.Button
         Friend WithEvents btnClearLog As System.Windows.Forms.Button
         Friend WithEvents btnRunAll As System.Windows.Forms.Button
+        Friend WithEvents btnProbeStress As System.Windows.Forms.Button
         Friend WithEvents lblLog As System.Windows.Forms.Label
         Friend WithEvents chkCOMSOL As System.Windows.Forms.CheckBox
         Friend WithEvents lblProfile As System.Windows.Forms.Label

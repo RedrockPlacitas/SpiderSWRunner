@@ -87,8 +87,12 @@ Imports System.Text
         '   3 = SineLines   (sinusoidal arc at peak/valley + straight tangent connectors)
         '   99 = COMSOL     (exact STEP geometry, N=7 only)
         ' Edge profiles:
-        '   10 = HalfRoll   (single circular arc, N forced to 1)
-        '   11 = DoubleRoll (two circular arcs same direction + center flat)
+        '   10 = HalfRoll      (single circular arc, N forced to 1)
+        '   11 = DoubleRoll    (two circular arcs same direction + center flat)
+        '   13 = Flat          (flat annular ring, no corrugation)
+        '   14 = Accordion     (N triangle pleats, alternating direction)
+        '   16 = LipRoll       (partial arc, theta < pi, with flat flanges)
+        '   17 = TriRadius     (three mutually tangent arcs)
         Public ProfileType As Integer = 0
 
         ' For ArcLines and SineLines: physical length of diagonal straight connector (mm)
@@ -149,6 +153,10 @@ Imports System.Text
 
         Public ReadOnly Property R_rolls_outer As Double
             Get
+                If ComponentMode = 1 Then
+                    ' Edge mode: roll spans full active width, lip is external
+                    Return R_outer
+                End If
                 Return R_outer - LipWidth
             End Get
         End Property
@@ -161,6 +169,10 @@ Imports System.Text
 
         Public ReadOnly Property R_roll_start As Double
             Get
+                If ComponentMode = 1 Then
+                    ' Edge mode: roll starts at inner attach, no fillet
+                    Return R_inner
+                End If
                 Return R_inner + FilletR
             End Get
         End Property
@@ -465,6 +477,10 @@ Imports System.Text
                 Case 10 : Return GeneratePoints_HalfRoll(pointsPerRoll)
                 Case 11 : Return GeneratePoints_DoubleRoll(pointsPerRoll)
                 Case 12 : Return GeneratePoints_Bullet(pointsPerRoll)
+                Case 13 : Return GeneratePoints_Flat()
+                Case 14 : Return GeneratePoints_Accordion(pointsPerRoll)
+                Case 16 : Return GeneratePoints_LipRoll(pointsPerRoll)
+                Case 17 : Return GeneratePoints_TriRadius(pointsPerRoll)
                 Case 99 : Return GeneratePoints_COMSOL(pointsPerRoll)
                 Case Else : Return GeneratePoints_Sinusoidal(pointsPerRoll)
             End Select
@@ -570,13 +586,19 @@ Imports System.Text
 
         Public Function GeneratePoints_HalfRoll(Optional ByVal ptsPerArc As Integer = 40) As List(Of ProfilePoint)
             Dim pts As New List(Of ProfilePoint)
-            pts.Add(New ProfilePoint(R_inner, 0.0))
+
+            ' Inner lip flat
+            If InnerLipWidth > 0.01 Then
+                pts.Add(New ProfilePoint(R_inner - InnerLipWidth, 0.0))
+            End If
             pts.Add(New ProfilePoint(R_roll_start, 0.0))
 
             Dim rolls As List(Of CircularArcRoll) = GetHalfRollArc()
             If rolls.Count = 0 Then
                 pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
-                pts.Add(New ProfilePoint(R_rolls_outer + LipWidth + 5.0, 0.0))
+                If LipWidth > 0.01 Then
+                    pts.Add(New ProfilePoint(R_rolls_outer + LipWidth, 0.0))
+                End If
                 Return pts
             End If
 
@@ -596,11 +618,15 @@ Imports System.Text
             For k As Integer = 1 To ptsPerArc
                 Dim t As Double = CDbl(k) / CDbl(ptsPerArc)
                 Dim a As Double = aStart + (aEnd - aStart) * t
-                pts.Add(New ProfilePoint(rl.Rc + rl.R_arc * Math.Cos(a),
+                pts.Add(New ProfilePoint(rl.Rc + rl.R_arc * Math.Cos(a), _
                                          rl.Zc + rl.R_arc * Math.Sin(a)))
             Next
 
-            pts.Add(New ProfilePoint(R_rolls_outer + LipWidth + 5.0, 0.0))
+            ' Outer lip flat
+            pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+            If LipWidth > 0.01 Then
+                pts.Add(New ProfilePoint(R_rolls_outer + LipWidth, 0.0))
+            End If
             Return pts
         End Function
 
@@ -931,6 +957,281 @@ Imports System.Text
         End Function
 
         ' ══════════════════════════════════════════════════════════════
+        ' Flat (ProfileType=13) — flat annular ring, no corrugation.
+        ' Used for cloth/tweeter surrounds. Compliance is pure plate bending.
+        ' ══════════════════════════════════════════════════════════════
+
+        Public Function GeneratePoints_Flat() As List(Of ProfilePoint)
+            Dim pts As New List(Of ProfilePoint)
+            ' Inner lip flat
+            If InnerLipWidth > 0.01 Then
+                pts.Add(New ProfilePoint(R_inner - InnerLipWidth, 0.0))
+            End If
+            pts.Add(New ProfilePoint(R_roll_start, 0.0))
+            ' Intermediate points for mesh quality across the flat span
+            Dim span As Double = R_rolls_outer - R_roll_start
+            Dim nPts As Integer = Math.Max(4, CInt(span / 1.0))
+            For k As Integer = 1 To nPts - 1
+                Dim r As Double = R_roll_start + span * CDbl(k) / CDbl(nPts)
+                pts.Add(New ProfilePoint(r, 0.0))
+            Next
+            pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+            ' Outer lip flat
+            If LipWidth > 0.01 Then
+                pts.Add(New ProfilePoint(R_rolls_outer + LipWidth, 0.0))
+            End If
+            Return pts
+        End Function
+
+        ' ══════════════════════════════════════════════════════════════
+        ' Accordion (ProfileType=14) — N triangle-wave pleats.
+        ' Identical structure to Sinusoidal but with linear V-shaped
+        ' wave instead of sine. Uses ComputeRollMetrics() for per-roll
+        ' pitch and H_eff, same endpoints and fillet handling.
+        '
+        ' Per-roll wave: Z_n(r) = dir_n * H_eff_n * tri(t)
+        '   where tri(t) = 2*t for t<=0.5, 2*(1-t) for t>0.5
+        ' ══════════════════════════════════════════════════════════════
+
+        Public Function GeneratePoints_Accordion(Optional ByVal pointsPerRoll As Integer = 30) As List(Of ProfilePoint)
+            Dim pts As New List(Of ProfilePoint)
+            Dim dir0 As Double
+            If FirstRollUp Then
+                dir0 = 1.0
+            Else
+                dir0 = -1.0
+            End If
+            Dim rm As RollMetrics = ComputeRollMetrics()
+
+            pts.Add(New ProfilePoint(R_inner, 0.0))
+
+            If FilletR > 0.01 Then
+                pts.Add(New ProfilePoint(R_roll_start, 0.0))
+            End If
+
+            For roll As Integer = 0 To N - 1
+                Dim d As Double
+                If roll Mod 2 = 0 Then
+                    d = dir0
+                Else
+                    d = -dir0
+                End If
+                Dim rs As Double = rm.RollStart(roll)
+                Dim p As Double = rm.Pitch(roll)
+                Dim h As Double = rm.H_eff_roll(roll)
+
+                ' Points within this roll (k=1 to pointsPerRoll-1)
+                For k As Integer = 1 To pointsPerRoll - 1
+                    Dim t As Double = CDbl(k) / CDbl(pointsPerRoll)
+                    Dim rv As Double = rs + p * t
+                    Dim tri As Double
+                    If t <= 0.5 Then
+                        tri = 2.0 * t
+                    Else
+                        tri = 2.0 * (1.0 - t)
+                    End If
+                    Dim z As Double = d * h * tri
+                    pts.Add(New ProfilePoint(rv, z))
+                Next
+
+                ' Zero-crossing at end of this roll (shared with start of next)
+                If roll < N - 1 Then
+                    pts.Add(New ProfilePoint(rs + p, 0.0))
+                End If
+            Next
+
+            pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+            pts.Add(New ProfilePoint(R_outer, 0.0))
+
+            Return pts
+        End Function
+
+        ' ══════════════════════════════════════════════════════════════
+        ' LipRoll (ProfileType=16) — partial arc with flat flanges.
+        ' Arc subtends angle theta (from ConnectorAngle, in degrees).
+        ' theta=180 is a full half-roll (same as Type 10).
+        ' theta<180 gives a shorter arc with flat sections at each end.
+        '
+        ' Arc geometry:
+        '   R_arc = H_eff / (1 - cos(theta/2))
+        '   half_chord = R_arc * sin(theta/2)
+        '   arc_width = 2 * half_chord
+        '   flat_each_side = (span - arc_width) / 2
+        ' ══════════════════════════════════════════════════════════════
+
+        Public Function GeneratePoints_LipRoll(Optional ByVal ptsPerArc As Integer = 40) As List(Of ProfilePoint)
+            Dim pts As New List(Of ProfilePoint)
+            Dim PI As Double = Math.PI
+            Dim span As Double = R_rolls_outer - R_roll_start
+            Dim h As Double = H_eff
+            Dim thetaDeg As Double = Math.Max(10.0, Math.Min(180.0, ConnectorAngle))
+            Dim thetaRad As Double = thetaDeg * PI / 180.0
+            Dim halfTheta As Double = thetaRad / 2.0
+
+            pts.Add(New ProfilePoint(R_inner - InnerLipWidth - 5.0, 0.0))
+            pts.Add(New ProfilePoint(R_inner, 0.0))
+
+            If h <= 0.0001 OrElse span <= 0.0001 Then
+                pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+                pts.Add(New ProfilePoint(R_rolls_outer + LipWidth + 5.0, 0.0))
+                Return pts
+            End If
+
+            ' Arc radius from height and subtended angle
+            Dim cosHalf As Double = Math.Cos(halfTheta)
+            Dim sinHalf As Double = Math.Sin(halfTheta)
+            If (1.0 - cosHalf) < 0.0001 Then
+                ' Nearly zero angle — degenerate to flat
+                pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+                pts.Add(New ProfilePoint(R_rolls_outer + LipWidth + 5.0, 0.0))
+                Return pts
+            End If
+
+            Dim R_arc As Double = h / (1.0 - cosHalf)
+            Dim halfChord As Double = R_arc * sinHalf
+            Dim arcWidth As Double = 2.0 * halfChord
+            Dim flatEach As Double = (span - arcWidth) / 2.0
+
+            ' Clamp: if arc is wider than span, reduce to full span
+            If flatEach < 0.0 Then
+                flatEach = 0.0
+                ' Recalculate: arc fills full span
+                halfChord = span / 2.0
+                R_arc = (h * h + halfChord * halfChord) / (2.0 * h)
+            End If
+
+            Dim arcStartR As Double = R_roll_start + flatEach
+            Dim arcEndR As Double = arcStartR + 2.0 * halfChord
+            Dim arcCenterR As Double = arcStartR + halfChord
+
+            ' Direction
+            Dim d As Double
+            If FirstRollUp Then
+                d = 1.0
+            Else
+                d = -1.0
+            End If
+
+            ' Arc center Z: center is below the apex
+            Dim ZcUp As Double = (h * h - halfChord * halfChord) / (2.0 * h)
+            Dim Zc As Double = d * ZcUp
+
+            ' Inner flat flange
+            If flatEach > 0.01 Then
+                Dim nFlat As Integer = Math.Max(2, CInt(flatEach / 0.5))
+                For k As Integer = 0 To nFlat
+                    pts.Add(New ProfilePoint(R_roll_start + flatEach * CDbl(k) / CDbl(nFlat), 0.0))
+                Next
+            Else
+                pts.Add(New ProfilePoint(R_roll_start, 0.0))
+            End If
+
+            ' Arc points
+            Dim aStart As Double = Math.Atan2(0.0 - Zc, arcStartR - arcCenterR)
+            Dim aEnd As Double = Math.Atan2(0.0 - Zc, arcEndR - arcCenterR)
+
+            If d > 0 Then
+                If aStart < PI / 2.0 Then aStart = aStart + 2.0 * PI
+                If aEnd > aStart Then aEnd = aEnd - 2.0 * PI
+            Else
+                If aStart > -PI / 2.0 Then aStart = aStart - 2.0 * PI
+                If aEnd < aStart Then aEnd = aEnd + 2.0 * PI
+            End If
+
+            For k As Integer = 1 To ptsPerArc
+                Dim t As Double = CDbl(k) / CDbl(ptsPerArc)
+                Dim a As Double = aStart + (aEnd - aStart) * t
+                pts.Add(New ProfilePoint(arcCenterR + R_arc * Math.Cos(a), _
+                                         Zc + R_arc * Math.Sin(a)))
+            Next
+
+            ' Outer flat flange
+            If flatEach > 0.01 Then
+                Dim nFlat As Integer = Math.Max(2, CInt(flatEach / 0.5))
+                For k As Integer = 0 To nFlat
+                    pts.Add(New ProfilePoint(arcEndR + flatEach * CDbl(k) / CDbl(nFlat), 0.0))
+                Next
+            End If
+
+            pts.Add(New ProfilePoint(R_rolls_outer + LipWidth + 5.0, 0.0))
+            Return pts
+        End Function
+
+        ' ══════════════════════════════════════════════════════════════
+        ' TriRadius (ProfileType=17) — three mutually tangent arcs.
+        ' Inner flank (C3), Crown (C2), Outer flank (C1).
+        '
+        ' User inputs:
+        '   BulletCx      -> R_inner_flank  (inner flank arc radius)
+        '   BulletR_Top   -> R_crown        (crown arc radius)
+        '   InnerLipWidth -> R_outer_flank  (outer flank arc radius)
+        '                    (InnerLipWidth also used for inner lip flat)
+        '
+        ' STUB — full tangency solver will be implemented next.
+        ' Currently generates a simple 3-arc approximation using
+        ' the same approach as Bullet but with proper tangency math.
+        ' ══════════════════════════════════════════════════════════════
+
+        Public Function GeneratePoints_TriRadius(Optional ByVal ptsPerArc As Integer = 30) As List(Of ProfilePoint)
+            ' Placeholder: returns a simple half-roll until tangency solver is implemented
+            Dim pts As New List(Of ProfilePoint)
+
+            ' Inner lip flat
+            If InnerLipWidth > 0.01 Then
+                pts.Add(New ProfilePoint(R_inner - InnerLipWidth, 0.0))
+            End If
+            pts.Add(New ProfilePoint(R_roll_start, 0.0))
+
+            ' Delegate to HalfRoll geometry for now
+            Dim span As Double = R_rolls_outer - R_roll_start
+            Dim h As Double = H_eff
+            Dim halfHp As Double = span / 2.0
+            If h <= 0.0001 OrElse span <= 0.0001 Then
+                pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+                If LipWidth > 0.01 Then
+                    pts.Add(New ProfilePoint(R_rolls_outer + LipWidth, 0.0))
+                End If
+                Return pts
+            End If
+
+            Dim R_arc As Double = (h * h + halfHp * halfHp) / (2.0 * h)
+            Dim ZcUp As Double = (h * h - halfHp * halfHp) / (2.0 * h)
+            Dim d As Double
+            If FirstRollUp Then
+                d = 1.0
+            Else
+                d = -1.0
+            End If
+            Dim Zc As Double = d * ZcUp
+            Dim Rc As Double = R_roll_start + halfHp
+            Dim PI As Double = Math.PI
+
+            Dim aStart As Double = Math.Atan2(0.0 - Zc, R_roll_start - Rc)
+            Dim aEnd As Double = Math.Atan2(0.0 - Zc, R_rolls_outer - Rc)
+            If d > 0 Then
+                If aStart < PI / 2.0 Then aStart = aStart + 2.0 * PI
+                If aEnd > aStart Then aEnd = aEnd - 2.0 * PI
+            Else
+                If aStart > -PI / 2.0 Then aStart = aStart - 2.0 * PI
+                If aEnd < aStart Then aEnd = aEnd + 2.0 * PI
+            End If
+
+            For k As Integer = 1 To ptsPerArc * 3
+                Dim t As Double = CDbl(k) / CDbl(ptsPerArc * 3)
+                Dim a As Double = aStart + (aEnd - aStart) * t
+                pts.Add(New ProfilePoint(Rc + R_arc * Math.Cos(a), _
+                                         Zc + R_arc * Math.Sin(a)))
+            Next
+
+            ' Outer lip flat
+            pts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+            If LipWidth > 0.01 Then
+                pts.Add(New ProfilePoint(R_rolls_outer + LipWidth, 0.0))
+            End If
+            Return pts
+        End Function
+
+        ' ══════════════════════════════════════════════════════════════
         ' Sinusoidal (ProfileType=0) — per-roll construction
         '
         ' Now uses ComputeRollMetrics() for per-roll pitch and H_eff.
@@ -1125,101 +1426,125 @@ Imports System.Text
         Public Function GetSketchSegments(Optional ptsPerRoll As Integer = 30) As List(Of ProfileSegment)
             Dim segs As New List(Of ProfileSegment)
 
-            If ProfileType = 2 OrElse ProfileType = 3 Then
-                ' ArcLines or SineLines: alternate line segments and arc splines
-                ' Now uses per-roll geometry from ComputeRollMetrics
+            If ProfileType = 14 Then
+                ' Accordion: inner line + corrugation spline + outer line
+                ' Separating flat flanges as lines prevents spline oscillation
+                ' at the flat-to-triangle transition.
                 Dim rm As RollMetrics = ComputeRollMetrics()
-                Dim PI As Double = Math.PI
-                Dim theta As Double = Math.Max(0.1, Math.Min(89.9, ConnectorAngle)) * PI / 180.0
-                Dim sth As Double = Math.Sin(theta)
-                Dim cth As Double = Math.Cos(theta)
-                Dim ptsPerArc As Integer = Math.Max(6, ptsPerRoll \ 2)
+                Dim dir0 As Double
+                If FirstRollUp Then
+                    dir0 = 1.0
+                Else
+                    dir0 = -1.0
+                End If
 
-                ' Lead-in line from R_inner to first arc start
-                Dim s0 As Double = Math.Max(0.0, Math.Min(StraightLength, rm.Pitch(0) * 0.48))
-                Dim straightFrac0 As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
-                Dim straightHalf0 As Double = (rm.Pitch(0) / 2.0) * straightFrac0
-                Dim arcHalf0 As Double = (rm.Pitch(0) / 2.0) - straightHalf0
+                ' Inner lip line
+                Dim innerLine As New List(Of ProfilePoint)
+                If InnerLipWidth > 0.01 Then
+                    innerLine.Add(New ProfilePoint(R_inner - InnerLipWidth, 0.0))
+                End If
+                innerLine.Add(New ProfilePoint(R_roll_start, 0.0))
+                segs.Add(New ProfileSegment(True, innerLine))
 
-                Dim firstArcStartR As Double = rm.RollStart(0) + straightHalf0
-
-                Dim linePts As New List(Of ProfilePoint)
-                linePts.Add(New ProfilePoint(R_inner, 0.0))
-                linePts.Add(New ProfilePoint(firstArcStartR, 0.0))
-                segs.Add(New ProfileSegment(True, linePts))
-
+                ' Corrugation spline: triangle wave from R_roll_start to R_rolls_outer
+                Dim corrPts As New List(Of ProfilePoint)
+                corrPts.Add(New ProfilePoint(R_roll_start, 0.0))
                 For roll As Integer = 0 To N - 1
-                    Dim rollUp As Boolean = If(roll Mod 2 = 0, FirstRollUp, Not FirstRollUp)
-                    Dim d As Double = If(rollUp, 1.0, -1.0)
-                    Dim pitch As Double = rm.Pitch(roll)
-                    Dim h As Double = rm.H_eff_roll(roll)
-                    Dim rs As Double = rm.RollStart(roll)
-
-                    Dim straightFrac As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
-                    Dim straightHalf As Double = (pitch / 2.0) * straightFrac
-                    Dim arcHalf As Double = (pitch / 2.0) - straightHalf
-
-                    Dim Rc As Double = rs + pitch / 2.0
-
-                    ' Compute arc geometry for this roll
-                    Dim R_arc As Double = If(arcHalf > 0.001, arcHalf*arcHalf/(2.0*h) + h/2.0, h)
-                    Dim halfAngle As Double = Math.Asin(Math.Min(1.0, arcHalf/R_arc))
-
-                    Dim Zc As Double = -d * (R_arc - h)
-
-                    Dim arcPts As New List(Of ProfilePoint)
-                    If ProfileType = 2 Then
-                        For k As Integer = 0 To ptsPerArc
-                            Dim alpha As Double = -halfAngle + 2.0*halfAngle*CDbl(k)/CDbl(ptsPerArc)
-                            arcPts.Add(New ProfilePoint(Rc + R_arc*Math.Sin(alpha), Zc + d*R_arc*Math.Cos(alpha)))
-                        Next
-                    Else  ' SineLines
-                        Dim phaseFrac As Double = 1.0 - straightFrac
-                        Dim phaseStart As Double = PI/2.0 - PI/2.0*phaseFrac
-                        Dim phaseEnd As Double = PI/2.0 + PI/2.0*phaseFrac
-                        For k As Integer = 0 To ptsPerArc
-                            Dim t As Double = CDbl(k)/CDbl(ptsPerArc)
-                            Dim rv As Double = (Rc - arcHalf) + 2.0*arcHalf*t
-                            Dim zv As Double = d*h*Math.Sin(phaseStart + (phaseEnd-phaseStart)*t)
-                            arcPts.Add(New ProfilePoint(rv, zv))
-                        Next
-                    End If
-                    segs.Add(New ProfileSegment(False, arcPts))
-
-                    ' Line from end of this arc to start of next (or to R_rolls_outer)
-                    Dim lineEndR As Double
-                    If roll < N - 1 Then
-                        Dim nextStraightFrac As Double = Math.Max(0.0, Math.Min(0.95, ConnectorAngle / 90.0))
-                        Dim nextStraightHalf As Double = (rm.Pitch(roll + 1) / 2.0) * nextStraightFrac
-                        Dim nextArcHalf As Double = (rm.Pitch(roll + 1) / 2.0) - nextStraightHalf
-                        lineEndR = rm.RollStart(roll + 1) + nextStraightHalf
+                    Dim d As Double
+                    If roll Mod 2 = 0 Then
+                        d = dir0
                     Else
-                        lineEndR = R_rolls_outer
+                        d = -dir0
+                    End If
+                    Dim rs As Double = rm.RollStart(roll)
+                    Dim p As Double = rm.Pitch(roll)
+                    Dim h As Double = rm.H_eff_roll(roll)
+                    For k As Integer = 1 To ptsPerRoll - 1
+                        Dim t As Double = CDbl(k) / CDbl(ptsPerRoll)
+                        Dim rv As Double = rs + p * t
+                        Dim tri As Double
+                        If t <= 0.5 Then
+                            tri = 2.0 * t
+                        Else
+                            tri = 2.0 * (1.0 - t)
+                        End If
+                        corrPts.Add(New ProfilePoint(rv, d * h * tri))
+                    Next
+                    If roll < N - 1 Then
+                        corrPts.Add(New ProfilePoint(rs + p, 0.0))
+                    End If
+                Next
+                corrPts.Add(New ProfilePoint(R_rolls_outer, 0.0))
+                segs.Add(New ProfileSegment(False, corrPts))
+
+                ' Outer lip line
+                Dim outerLine As New List(Of ProfilePoint)
+                outerLine.Add(New ProfilePoint(R_rolls_outer, 0.0))
+                If LipWidth > 0.01 Then
+                    outerLine.Add(New ProfilePoint(R_rolls_outer + LipWidth, 0.0))
+                Else
+                    outerLine.Add(New ProfilePoint(R_rolls_outer + 1.0, 0.0))
+                End If
+                segs.Add(New ProfileSegment(True, outerLine))
+
+            ' NOTE: ArcLines (2) and SineLines (3) previously had a dedicated ElseIf
+            ' block here that drew alternating line+arc segments. That code had a bug:
+            ' connector line endpoints used Z=0 but arc splines ended at non-zero Z,
+            ' creating gaps in the sketch that broke the SW revolve.
+            ' These profile types now fall through to the default auto-split path below,
+            ' which calls GeneratePoints() (correct coordinates) and draws one continuous
+            ' spline for the corrugation. This matches the COMSOL profile approach.
+
+            Else
+                ' Default: auto-split into inner line + corrugation spline + outer line.
+                ' Scans GeneratePoints output for the first/last non-zero Z to find
+                ' where corrugation begins and ends. Prevents spline oscillation at
+                ' flat-to-curve transitions.
+                Dim pts As List(Of ProfilePoint) = GeneratePoints(30)
+
+                ' Find first and last non-zero Z indices
+                Dim firstNZ As Integer = -1
+                Dim lastNZ As Integer = -1
+                For i As Integer = 0 To pts.Count - 1
+                    If Math.Abs(pts(i).Z) > 0.0001 Then
+                        If firstNZ < 0 Then firstNZ = i
+                        lastNZ = i
+                    End If
+                Next
+
+                If firstNZ < 0 Then
+                    ' All flat — just lines
+                    Dim lp As New List(Of ProfilePoint)
+                    lp.Add(pts(0))
+                    lp.Add(pts(pts.Count - 1))
+                    segs.Add(New ProfileSegment(True, lp))
+                Else
+                    ' Inner flat line: from first point to the last z=0 point before corrugation
+                    Dim innerEnd As Integer = Math.Max(0, firstNZ - 1)
+                    If innerEnd > 0 Then
+                        Dim innerPts As New List(Of ProfilePoint)
+                        innerPts.Add(pts(0))
+                        innerPts.Add(pts(innerEnd))
+                        segs.Add(New ProfileSegment(True, innerPts))
                     End If
 
-                    Dim lp As New List(Of ProfilePoint)
-                    lp.Add(New ProfilePoint(Rc + arcHalf, 0.0))
-                    lp.Add(New ProfilePoint(lineEndR, 0.0))
-                    segs.Add(New ProfileSegment(True, lp))
-                Next
+                    ' Corrugation spline: from last flat before corrugation to first flat after
+                    Dim spStart As Integer = Math.Max(0, firstNZ - 1)
+                    Dim spEnd As Integer = Math.Min(pts.Count - 1, lastNZ + 1)
+                    Dim spPts As New List(Of ProfilePoint)
+                    For i As Integer = spStart To spEnd
+                        spPts.Add(pts(i))
+                    Next
+                    segs.Add(New ProfileSegment(False, spPts))
 
-                Dim lipPts As New List(Of ProfilePoint)
-                lipPts.Add(New ProfilePoint(R_rolls_outer, 0.0))
-                lipPts.Add(New ProfilePoint(R_rolls_outer + LipWidth + 5.0, 0.0))
-                segs.Add(New ProfileSegment(True, lipPts))
-            Else
-                ' Continuous profile (Sin, Arc, COMSOL): one spline + one lip line
-                ' (HalfRoll/DoubleRoll are drawn with CreateArc, not via this path)
-                Dim pts As List(Of ProfilePoint) = GeneratePoints(30)
-                Dim splinePts As New List(Of ProfilePoint)
-                For i As Integer = 0 To pts.Count - 2
-                    splinePts.Add(pts(i))
-                Next
-                segs.Add(New ProfileSegment(False, splinePts))
-                Dim lp As New List(Of ProfilePoint)
-                lp.Add(pts(pts.Count - 2))
-                lp.Add(pts(pts.Count - 1))
-                segs.Add(New ProfileSegment(True, lp))
+                    ' Outer flat line: from first flat after corrugation to last point
+                    If spEnd < pts.Count - 1 Then
+                        Dim outerPts As New List(Of ProfilePoint)
+                        outerPts.Add(pts(spEnd))
+                        outerPts.Add(pts(pts.Count - 1))
+                        segs.Add(New ProfileSegment(True, outerPts))
+                    End If
+                End If
             End If
 
             Return segs
@@ -1240,10 +1565,12 @@ Imports System.Text
 
         ''' <summary>
         ''' True if this profile type uses CreateArc entities in SW instead of splines.
+        ''' DISABLED: CreateArc API is unreliable in SW2014/2022. All types now use
+        ''' spline-through-points from GeneratePoints(), which is proven reliable.
         ''' </summary>
         Public ReadOnly Property UsesArcEntities As Boolean
             Get
-                Return ProfileType = 1 OrElse ProfileType = 10 OrElse ProfileType = 11
+                Return False
             End Get
         End Property
 
@@ -1281,6 +1608,37 @@ Imports System.Text
                 Return crests
             End If
 
+            If ProfileType = 13 Then
+                ' Flat: no crest, return midpoint for reference
+                Dim crests As New List(Of Double)()
+                crests.Add(R_roll_start + (R_rolls_outer - R_roll_start) / 2.0)
+                Return crests
+            End If
+
+            If ProfileType = 14 Then
+                ' Accordion: crest of each pleat at midpoint
+                Dim crests As New List(Of Double)()
+                Dim pitch As Double = EffPitch
+                For i As Integer = 0 To N - 1
+                    crests.Add(R_roll_start + (CDbl(i) + 0.5) * pitch)
+                Next
+                Return crests
+            End If
+
+            If ProfileType = 16 Then
+                ' LipRoll: crest at midpoint of arc
+                Dim crests As New List(Of Double)()
+                crests.Add(R_roll_start + (R_rolls_outer - R_roll_start) / 2.0)
+                Return crests
+            End If
+
+            If ProfileType = 17 Then
+                ' TriRadius: crest at midpoint (placeholder)
+                Dim crests As New List(Of Double)()
+                crests.Add(R_roll_start + (R_rolls_outer - R_roll_start) / 2.0)
+                Return crests
+            End If
+
             ' Spider profiles with per-roll pitch
             Dim rm As RollMetrics = ComputeRollMetrics()
             Dim crestsS As New List(Of Double)
@@ -1302,6 +1660,10 @@ Imports System.Text
                 Case 10 : profileName = "Half Roll"
                 Case 11 : profileName = "Double Roll"
                 Case 12 : profileName = "Bullet"
+                Case 13 : profileName = "Flat"
+                Case 14 : profileName = "Accordion"
+                Case 16 : profileName = "Lip Roll"
+                Case 17 : profileName = "Tri-Radius"
                 Case 99 : profileName = "COMSOL Arc+Lines (STEP)"
                 Case Else : profileName = "Sinusoidal"
             End Select
@@ -1322,6 +1684,14 @@ Imports System.Text
             End If
             If ProfileType = 11 Then
                 sb.AppendLine(String.Format("CenterFlat={0:F2}mm", CenterFlat))
+            End If
+            If ProfileType = 14 Then
+                sb.AppendLine(String.Format("Accordion: N_pleats={0}  H_pleat_pp={1:F2}mm  pitch={2:F3}mm", _
+                    N, H_pp, EffPitch))
+            End If
+            If ProfileType = 16 Then
+                sb.AppendLine(String.Format("LipRoll: ArcAngle={0:F1}deg  H_pp={1:F2}mm", _
+                    ConnectorAngle, H_pp))
             End If
             If ProfileType = 12 Then
                 sb.AppendLine(String.Format("Bullet: width={0:F2}mm  H_pp={1:F2}mm  R2={2:F2}mm  Cx={3:F2}mm  InnerLip={4:F2}mm", _

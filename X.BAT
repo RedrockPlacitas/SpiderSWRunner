@@ -1,0 +1,13 @@
+C:\Projects\SpiderSWRunner\TriRadius-SpiderNL
+c:\users\cad\appdata\local\temp\Part36-SpiderNL
+c:\users\cad\appdata\local\temp\Part37-SpiderNL
+c:\users\cad\appdata\local\temp\Part37-SpiderNL
+c:\users\cad\appdata\local\temp\Part38-SpiderNL
+c:\users\cad\appdata\local\temp\Part38-SpiderNL
+c:\users\cad\appdata\local\temp\Part39-SpiderNL
+c:\users\cad\appdata\local\temp\Part39-SpiderNL
+c:\users\cad\appdata\local\temp\Part40-SpiderNL
+c:\users\cad\appdata\local\temp\Part40-SpiderNL
+c:\users\cad\appdata\local\temp\Part44-SpiderNL
+c:\users\cad\appdata\local\temp\Part44-SpiderNL
+c:\users\cad\appdata\local\temp\Part45-SpiderNL
