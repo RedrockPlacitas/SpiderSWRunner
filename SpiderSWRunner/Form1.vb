@@ -77,6 +77,10 @@ Imports Microsoft.VisualBasic
             If p.UseNaturalH Then
                 base = base & "_natH"
             End If
+            ' Add straight-length tag for line profiles (non-default SLen only)
+            If (p.ProfileType = 2 OrElse p.ProfileType = 3) AndAlso p.StraightLength <> 1.0 Then
+                base = base & String.Format("_SL{0:0.0}", p.StraightLength)
+            End If
             ' Add First-Down marker (First-Up is default, no tag)
             If Not p.FirstRollUp Then
                 base = base & "_FD"
@@ -442,7 +446,7 @@ Imports Microsoft.VisualBasic
                 Case 2  ' NBR_SBR_rubber
                     tbE.Text = "12" : tbNu.Text = "0.47" : tbDensity.Text = "1100"
                 Case 3  ' Polyester_foam
-                    tbE.Text = "3" : tbNu.Text = "0.20" : tbDensity.Text = "200"
+                    tbE.Text = "1.0" : tbNu.Text = "0.30" : tbDensity.Text = "90"
                 Case 4  ' Cloth_spider
                     tbE.Text = "89" : tbNu.Text = "0.30" : tbDensity.Text = "660"
                 Case 5  ' Cloth_A_PolyCotton

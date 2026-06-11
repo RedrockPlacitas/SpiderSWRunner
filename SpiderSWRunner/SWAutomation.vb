@@ -1367,7 +1367,38 @@ Imports SolidWorks.Interop.cosworks
                         Catch
                         End Try
 
-                        Log("  *** MANUAL: Study Properties -> click 'Fixed' radio -> OK ***")
+                        ' Force FIXED stepping (disable autostepping) so the increment is honored.
+                        ' SW 2014 property name varies; try the known candidates and log which one takes.
+                        Dim autoOff As Boolean = False
+                        For Each aName As String In New String() { _
+                            "Autostepping", "AutoStepping", "UseAutostepping", _
+                            "AutomaticTimeStepping", "AutoTimeStepping"}
+                            Try
+                                CallByName(opts, aName, CallType.Set, 0)
+                                Log(String.Format("  Autostepping = OFF (via {0})", aName))
+                                autoOff = True
+                                Exit For
+                            Catch
+                            End Try
+                        Next
+
+                        If autoOff Then
+                            Log("  Stepping = FIXED (set automatically)")
+                        Else
+                            ' Could not set via API; surface the real property names, then fall back to manual.
+                            Try
+                                For Each m As MemberInfo In opts.GetType().GetMembers()
+                                    If m.MemberType = MemberTypes.Property Then
+                                        Dim nm As String = m.Name.ToLower()
+                                        If nm.Contains("step") OrElse nm.Contains("auto") Then
+                                            Log("    opts prop: " & m.Name)
+                                        End If
+                                    End If
+                                Next
+                            Catch
+                            End Try
+                            Log("  *** MANUAL: Study Properties -> click 'Fixed' radio -> OK ***")
+                        End If
                     Else
                         Log("  Could not find options. Enumerating study members...")
                         Dim stType As Type = _study.GetType()
@@ -1925,8 +1956,10 @@ Imports SolidWorks.Interop.cosworks
                         Dim profStressOK As Boolean = False
                         If stressOK Then
                             Log(String.Format("  Tier 1: extracting stress for {0} profile nodes...", profileNodes.Count))
+                            System.Windows.Forms.Application.DoEvents()  ' flush start message
                             Dim t0 As DateTime = DateTime.Now
                             Dim sFails As Integer = 0
+                            Dim reportEvery As Integer = Math.Max(1, profileNodes.Count \ 10)
                             For pi As Integer = 0 To profileNodes.Count - 1
                                 Dim nid As Integer = profileNodes(pi)
                                 Try
@@ -1942,11 +1975,22 @@ Imports SolidWorks.Interop.cosworks
                                 Catch ex As Exception
                                     sFails += 1
                                 End Try
+                                ' Progress every ~10% with elapsed and ETA - so the user sees the
+                                ' run is alive during the ~60-second per-node-API phase
+                                If ((pi + 1) Mod reportEvery = 0) OrElse (pi = profileNodes.Count - 1) Then
+                                    Dim el As Double = (DateTime.Now - t0).TotalSeconds
+                                    Dim pct As Double = (pi + 1) * 100.0 / profileNodes.Count
+                                    Dim eta As Double = If(pi + 1 > 0, el * (profileNodes.Count - pi - 1) / (pi + 1), 0.0)
+                                    Log(String.Format("    Tier 1: {0}/{1} ({2:F0}%)  elapsed {3:F1}s  ETA {4:F1}s", _
+                                        pi + 1, profileNodes.Count, pct, el, eta))
+                                    System.Windows.Forms.Application.DoEvents()
+                                End If
                                 System.Windows.Forms.Application.DoEvents()
                             Next
                             profStressOK = (sFails < profileNodes.Count)
                             Log(String.Format("  Tier 1 done in {0:F1}s ({1} failures)", _
                                 (DateTime.Now - t0).TotalSeconds, sFails))
+                            System.Windows.Forms.Application.DoEvents()  ' flush "done" message
                         End If
 
                         ' Build _profile.csv
@@ -2006,6 +2050,25 @@ Imports SolidWorks.Interop.cosworks
                         Dim profPath As String = outputPath.Replace("_auto.csv", "_profile.csv")
                         System.IO.File.WriteAllText(profPath, sbProf.ToString())
                         Log("  Profile CSV: " & profPath)
+                        System.Windows.Forms.Application.DoEvents()
+
+                        ' Disk-based completion sentinel — independent of UI repaint.
+                        ' If this file appears next to the CSVs, the extraction is complete
+                        ' and the runner may be closed safely (even if the log textbox has
+                        ' not yet refreshed to show the "complete" message).
+                        Try
+                            Dim donePath As String = outputPath.Replace("_auto.csv", "_DONE.txt")
+                            Dim doneText As String = _
+                                "ExtractResultsAuto completed at " & _
+                                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") & System.Environment.NewLine & _
+                                "auto:    " & outputPath & System.Environment.NewLine & _
+                                "profile: " & profPath & System.Environment.NewLine
+                            System.IO.File.WriteAllText(donePath, doneText)
+                            Log("  Sentinel: " & donePath)
+                            System.Windows.Forms.Application.DoEvents()
+                        Catch sentEx As Exception
+                            Log("  Sentinel write failed: " & sentEx.Message)
+                        End Try
                     Else
                         Log("  WARNING: Too few profile nodes found — skipping profile extraction")
                     End If
@@ -2014,6 +2077,22 @@ Imports SolidWorks.Interop.cosworks
                 End Try
 
                 Log("=== ExtractResultsAuto complete ===")
+                System.Windows.Forms.Application.DoEvents()
+
+                ' Explicit COM release before function exit. Without this, the heavy
+                ' CWResults reference goes out of scope and the .NET runtime invokes
+                ' Marshal.Release() implicitly, which can stall the UI thread for many
+                ' seconds while SW finishes any pending operations on the results object.
+                ' The user perceives this as a "phantom hang" — the CSVs and the sentinel
+                ' are on disk but the UI never repaints to show the completion message.
+                Try
+                    If results IsNot Nothing Then
+                        System.Runtime.InteropServices.Marshal.ReleaseComObject(results)
+                    End If
+                    System.Runtime.InteropServices.Marshal.CleanupUnusedObjectsInCurrentContext()
+                Catch : End Try
+                System.Windows.Forms.Application.DoEvents()
+
                 Return True
             Catch ex As System.Exception
                 Log("ERROR in ExtractResultsAuto: " & ex.Message)
