@@ -23,26 +23,10 @@ Imports Microsoft.VisualBasic
             UpdateComputed()
         End Sub
 
+        ' Filename convention lives in BatchRunner (single source of truth
+        ' for single runs AND batch runs). These wrappers preserve callers.
         Private Function ProfileTag(p As SpiderProfile) As String
-            Select Case p.ProfileType
-                Case 1 : Return "Arc"
-                Case 2 : Return "ArcLines"
-                Case 3 : Return "SineLines"
-                Case 10
-                    If p.FirstRollUp Then
-                        Return "HalfRoll"
-                    Else
-                        Return "InvRoll"
-                    End If
-                Case 11 : Return "DoubleRoll"
-                Case 12 : Return "Bullet"
-                Case 13 : Return "Flat"
-                Case 14 : Return "Triangle"
-                Case 16 : Return "LipRoll"
-                Case 17 : Return "TriRadius"
-                Case 99 : Return "COMSOL"
-                Case Else : Return "Sin"
-            End Select
+            Return BatchRunner.ProfileTag(p)
         End Function
 
         ''' <summary>
@@ -56,43 +40,7 @@ Imports Microsoft.VisualBasic
         End Function
 
         Private Function BuildOutputFilename(p As SpiderProfile) As String
-            Dim modeStr As String = If(p.ComponentMode = 1, "Edge", "Spider")
-            Dim tag As String = ProfileTag(p)
-            Dim matTag As String = p.MaterialName.Replace(" ", "_")
-            Dim base As String = String.Format("{0}_N{1}_ID{2}_OD{3}_{4}_Hpp{5:F1}_T{6:F2}_{7}", _
-                modeStr, p.N, CInt(p.ID), CInt(p.OD), tag, p.H_pp, p.T, matTag)
-            ' Add angle suffix for ArcLines/SineLines
-            If p.ProfileType = 2 OrElse p.ProfileType = 3 Then
-                base = base & String.Format("_A{0}", CInt(p.ConnectorAngle))
-            End If
-            ' Add taper suffix if non-zero
-            If p.TaperPct <> 0 Then
-                base = base & String.Format("_Tp{0}", CInt(p.TaperPct))
-            End If
-            ' Add pitch taper suffix if active
-            If p.VariablePitch AndAlso p.PitchTaperPct <> 0 Then
-                base = base & String.Format("_Pt{0}", CInt(p.PitchTaperPct))
-            End If
-            ' Add natural H marker
-            If p.UseNaturalH Then
-                base = base & "_natH"
-            End If
-            ' Add straight-length tag for line profiles (non-default SLen only)
-            If (p.ProfileType = 2 OrElse p.ProfileType = 3) AndAlso p.StraightLength <> 1.0 Then
-                base = base & String.Format("_SL{0:0.0}", p.StraightLength)
-            End If
-            ' Add First-Down marker (First-Up is default, no tag)
-            If Not p.FirstRollUp Then
-                base = base & "_FD"
-            End If
-            ' Add direction suffix
-            If IsPullDirection() Then
-                base = base & "_Pull"
-            Else
-                base = base & "_Push"
-            End If
-            base = base & "_auto.csv"
-            Return base
+            Return BatchRunner.BuildOutputFilename(p, IsPullDirection())
         End Function
 
         Private Function D(ByVal tb As TextBox, ByVal def As Double) As Double
@@ -531,9 +479,10 @@ Imports Microsoft.VisualBasic
             Dim maxD As Double = D(tbMaxDisp, 10.0)
             Dim steps As Integer = I(tbSteps, 20)
             If IsPullDirection() Then
-                LogMessage("*** PULL (-Y) selected. After Setup, check 'Reverse direction' on the prescribed displacement in the SW study tree. ***")
+                LogMessage("PULL (-Y): applied automatically as a negative prescribed displacement.")
+                LogMessage("(Equivalent to the old manual 'Reverse direction' checkbox — verify Kms0 vs a prior manual Pull run on first use.)")
             End If
-            MarkButton(btnSetupStudy, _sw.SetupStudy(p, maxD, steps))
+            MarkButton(btnSetupStudy, _sw.SetupStudy(p, maxD, steps, IsPullDirection()))
             Cursor = Cursors.Default
         End Sub
 
@@ -583,7 +532,10 @@ Imports Microsoft.VisualBasic
             MarkButton(btnCreatePart, True)
 
             ' Step 3 — Setup Study
-            If Not _sw.SetupStudy(p, maxD, steps) Then
+            If IsPullDirection() Then
+                LogMessage("PULL (-Y): applied automatically as a negative prescribed displacement.")
+            End If
+            If Not _sw.SetupStudy(p, maxD, steps, IsPullDirection()) Then
                 MarkButton(btnSetupStudy, False)
                 Cursor = Cursors.Default
                 Return
@@ -647,6 +599,72 @@ Imports Microsoft.VisualBasic
                 LogMessage("ERROR: " & ex.Message)
             End Try
             Cursor = Cursors.Default
+        End Sub
+
+        Private Sub btnBatch_Click(ByVal sender As Object, ByVal e As EventArgs) _
+            Handles btnBatch.Click
+            ' ─────────────────────────────────────────────────────────
+            ' Opens the Batch Sweep form. The CURRENT main-form fields
+            ' become the base configuration; swept variables override
+            ' them per generated row.
+            ' ─────────────────────────────────────────────────────────
+            Try
+                Dim p As SpiderProfile = BuildProfile()
+                Dim base As New BatchRow()
+                base.ComponentMode = p.ComponentMode
+                base.ID = p.ID
+                base.OD = p.OD
+                base.N = p.N
+                base.H_pp = p.H_pp
+                base.T = p.T
+                base.LipWidth = p.LipWidth
+                base.InnerLipWidth = p.InnerLipWidth
+                base.FirstRollUp = p.FirstRollUp
+                base.ProfileType = p.ProfileType
+                base.ConnectorAngle = p.ConnectorAngle
+                base.StraightLength = p.StraightLength
+                base.CenterFlat = p.CenterFlat
+                base.BulletR_Top = p.BulletR_Top
+                base.BulletCx = p.BulletCx
+                base.TaperPct = p.TaperPct
+                base.VariablePitch = p.VariablePitch
+                base.PitchTaperPct = p.PitchTaperPct
+                base.UseNaturalH = p.UseNaturalH
+                base.MaterialName = p.MaterialName
+                base.E = p.E
+                base.Nu = p.Nu
+                base.Density = p.Density
+                base.MaxDisp = D(tbMaxDisp, 10.0)
+                base.Steps = I(tbSteps, 20)
+                base.Direction = If(IsPullDirection(), "Pull", "Push")
+                base.OutputDir = tbOutputDir.Text.Trim()
+
+                Dim f As New BatchForm(base, _sw)
+                f.Show(Me)
+            Catch ex As System.Exception
+                LogMessage("ERROR opening Batch form: " & ex.Message)
+            End Try
+        End Sub
+
+        Private Sub btnDumpApi_Click(ByVal sender As Object, ByVal e As EventArgs) _
+            Handles btnDumpApi.Click
+            ' ─────────────────────────────────────────────────────────
+            ' Dumps the SW2014 Simulation interop member names (shell,
+            ' material, mesh, nonlinear options...) to a text file.
+            ' Run ONCE and report the file — it locks the exact property
+            ' names for stepping/material/mesh on this SW version.
+            ' No SolidWorks connection required (reflects the DLL).
+            ' ─────────────────────────────────────────────────────────
+            Try
+                Dim outPath As String = "C:\SpiderSW_Results\SimAPI_Members.txt"
+                Dim dir As String = System.IO.Path.GetDirectoryName(outPath)
+                If Not System.IO.Directory.Exists(dir) Then
+                    System.IO.Directory.CreateDirectory(dir)
+                End If
+                _sw.DumpSimApiMembers(outPath)
+            Catch ex As System.Exception
+                LogMessage("ERROR: " & ex.Message)
+            End Try
         End Sub
 
         ' ══════════════════════════════════════

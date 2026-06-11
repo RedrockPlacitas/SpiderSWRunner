@@ -57,6 +57,11 @@
     <Compile Include="Program.vb" />
     <Compile Include="SpiderProfile.vb" />
     <Compile Include="SWAutomation.vb" />
+    <Compile Include="SweepMatrix.vb" />
+    <Compile Include="BatchRunner.vb" />
+    <Compile Include="BatchForm.vb">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="My Project\AssemblyInfo.vb" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.VisualBasic.targets" />

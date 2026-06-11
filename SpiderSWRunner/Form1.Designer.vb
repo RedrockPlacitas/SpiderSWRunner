@@ -193,11 +193,15 @@
             btnClearLog = AddButton("Clear Log", 8 + bw + gap, yPos, 80, bh)
             btnRunAll = AddButton("Run All (1-5)", 8 + (bw + gap) * 2, yPos, bw, bh)
             btnRunAll.BackColor = System.Drawing.Color.FromArgb(220, 230, 255)
+            btnBatch = AddButton("Batch Sweep...", 8 + (bw + gap) * 3, yPos, bw, bh)
+            btnBatch.BackColor = System.Drawing.Color.FromArgb(210, 245, 210)
 
             ' ── Row 3: diagnostic ──
             yPos += bh + 4
             btnProbeStress = AddButton("Probe Stress API", 8, yPos, bw + 30, bh)
             btnProbeStress.BackColor = System.Drawing.Color.FromArgb(255, 230, 200)
+            btnDumpApi = AddButton("Dump Sim API", 8 + bw + 30 + gap, yPos, bw, bh)
+            btnDumpApi.BackColor = System.Drawing.Color.FromArgb(255, 230, 200)
 
             ' COMSOL profile checkbox
             chkCOMSOL = New System.Windows.Forms.CheckBox()
@@ -321,6 +325,8 @@
         Friend WithEvents btnClearLog As System.Windows.Forms.Button
         Friend WithEvents btnRunAll As System.Windows.Forms.Button
         Friend WithEvents btnProbeStress As System.Windows.Forms.Button
+        Friend WithEvents btnBatch As System.Windows.Forms.Button
+        Friend WithEvents btnDumpApi As System.Windows.Forms.Button
         Friend WithEvents lblLog As System.Windows.Forms.Label
         Friend WithEvents chkCOMSOL As System.Windows.Forms.CheckBox
         Friend WithEvents lblProfile As System.Windows.Forms.Label

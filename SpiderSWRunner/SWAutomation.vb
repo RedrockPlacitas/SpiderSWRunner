@@ -914,7 +914,8 @@ Imports SolidWorks.Interop.cosworks
         ' ──────────────────────────────────────────────────────────────
         Public Function SetupStudy(ByVal profile As SpiderProfile, _
                                     ByVal maxDisp_mm As Double, _
-                                    ByVal nSteps As Integer) As Boolean
+                                    ByVal nSteps As Integer, _
+                                    Optional ByVal isPull As Boolean = False) As Boolean
             If _swApp Is Nothing OrElse _model Is Nothing Then
                 Log("ERROR: No active model.")
                 Return False
@@ -991,7 +992,8 @@ Imports SolidWorks.Interop.cosworks
                     Log("  Part material failed: " & ex.Message)
                 End Try
 
-                ' Step B: Apply to Simulation study via SolidManager
+                ' Step B: Apply to Simulation study via SolidManager (solid bodies only;
+                ' for shell studies the real assignment happens in 3.3 on the CWShell).
                 Try
                     Dim solidMgr As CWSolidManager = _study.SolidManager
                     If solidMgr IsNot Nothing Then
@@ -1001,98 +1003,88 @@ Imports SolidWorks.Interop.cosworks
                             Dim smErr As Integer = 0
                             Dim comp As CWSolidComponent = solidMgr.GetComponentAt(0, smErr)
                             If comp IsNot Nothing Then
-                                Dim compObj As Object = DirectCast(comp, Object)
-                                Log("  Got SolidComponent")
-
-                                ' Try SetLibraryMaterial on the COMPONENT (not body)
-                                Try
-                                    CallByName(compObj, "SetLibraryMaterial", CallType.Method, _
-                                        "Edge_Materials", profile.MaterialName)
-                                    Log("  Component SetLibraryMaterial (Edge_Materials): OK")
-                                Catch ex2 As System.Exception
-                                    Try
-                                        CallByName(compObj, "SetLibraryMaterial", CallType.Method, _
-                                            "Spider Materials", profile.MaterialName)
-                                        Log("  Component SetLibraryMaterial (Spider Materials): OK")
-                                    Catch ex3 As System.Exception
-                                        Log("  Component SetLibraryMaterial: " & ex3.Message)
-                                    End Try
-                                End Try
-
-                                ' Also try on body index 0 with error handling
+                                If ApplyLibraryMaterialTo(DirectCast(comp, Object), profile, "SolidComponent") Then
+                                    Log("  SolidComponent material: OK")
+                                End If
                                 Try
                                     Dim body As CWSolidBody = comp.GetSolidBodyAt(0, smErr)
                                     If body IsNot Nothing Then
-                                        Try
-                                            CallByName(DirectCast(body, Object), "SetLibraryMaterial", _
-                                                CallType.Method, "Edge_Materials", profile.MaterialName)
-                                            Log("  Body SetLibraryMaterial (Edge_Materials): OK")
-                                        Catch
-                                            CallByName(DirectCast(body, Object), "SetLibraryMaterial", _
-                                                CallType.Method, "Spider Materials", profile.MaterialName)
-                                            Log("  Body SetLibraryMaterial (Spider Materials): OK")
-                                        End Try
+                                        If ApplyLibraryMaterialTo(DirectCast(body, Object), profile, "SolidBody") Then
+                                            Log("  SolidBody material: OK")
+                                        End If
                                     Else
                                         Log(String.Format("  GetSolidBodyAt: err={0} (expected for shells)", smErr))
                                     End If
                                 Catch
                                 End Try
-
-                                ' Enumerate component members for material-related methods
-                                Log("  Component members (material/set/lib):")
-                                For Each m As MemberInfo In compObj.GetType().GetMembers()
-                                    If m.MemberType = MemberTypes.Method OrElse _
-                                       m.MemberType = MemberTypes.Property Then
-                                        Dim nm As String = m.Name.ToLower()
-                                        If nm.Contains("material") OrElse nm.Contains("lib") OrElse _
-                                           nm.Contains("shell") OrElse nm.Contains("body") Then
-                                            Log("    " & m.MemberType.ToString() & ": " & m.Name)
-                                        End If
-                                    End If
-                                Next
                             End If
                         End If
                     End If
                 Catch ex As System.Exception
-                    Log("  Simulation material failed: " & ex.Message)
+                    Log("  Simulation material (solid path): " & ex.Message)
                 End Try
 
-                ' ─── 3.3 Shell thickness ───
+                ' ─── 3.3 Shell thickness + shell material ───
                 Log("")
-                Log("Shell thickness...")
+                Log("Shell thickness + material...")
+                Dim shellOK As Boolean = False
+                Dim shellMatOK As Boolean = False
                 Try
                     Dim shellMgr As CWShellManager = _study.ShellManager
                     If shellMgr IsNot Nothing AndAlso shellMgr.ShellCount > 0 Then
                         Dim shErr As Integer = 0
                         Dim sh As CWShell = shellMgr.GetShellAt(0, shErr)
                         If sh IsNot Nothing Then
+                            ' --- Thickness (BeginEdit/EndEdit IS the OK button) ---
                             sh.ShellBeginEdit()
                             Try
                                 sh.ShellUnit = CInt(swsLinearUnit_e.swsLinearUnitMillimeters)
                             Catch
                             End Try
                             Try
-                                CallByName(DirectCast(sh, Object), "ShellThickness", CallType.Set, CDbl(profile.T))
-                            Catch
+                                sh.ShellThickness = CDbl(profile.T)
+                            Catch ex2 As System.Exception
+                                Log("  ShellThickness set failed: " & ex2.Message)
                             End Try
+                            Dim endRet As Object = Nothing
                             Try
-                                CallByName(DirectCast(sh, Object), "SetLibraryMaterial", CallType.Method, _
-                                    "Edge_Materials", profile.MaterialName)
+                                endRet = CallByName(DirectCast(sh, Object), "ShellEndEdit", CallType.Method)
                             Catch
-                                Try
-                                    CallByName(DirectCast(sh, Object), "SetLibraryMaterial", CallType.Method, _
-                                        "Spider Materials", profile.MaterialName)
-                                Catch
-                                End Try
+                                Try : sh.ShellEndEdit() : Catch : End Try
                             End Try
-                            sh.ShellEndEdit()
+
+                            ' Read-back verification
+                            Try
+                                Dim tBack As Double = CDbl(sh.ShellThickness)
+                                Log(String.Format("  Shell thickness applied: {0:F3} mm (read-back {1:F3}, EndEdit={2})", _
+                                    profile.T, tBack, If(endRet Is Nothing, "?", endRet.ToString())))
+                                shellOK = (Math.Abs(tBack - profile.T) < 0.001)
+                            Catch
+                                Log(String.Format("  Shell thickness set to {0:F3} mm (read-back unavailable)", profile.T))
+                                shellOK = True
+                            End Try
+
+                            ' --- Shell material: library DB by FULL PATH (primary),
+                            '     verified by reading back Nu and the G/E ratio ---
+                            shellMatOK = ApplyShellLibraryMaterial(sh, profile)
+
+                            ' --- Fallback: custom in-code material with explicit E/Nu/G/Density ---
+                            If Not shellMatOK Then
+                                shellMatOK = ApplyCustomShellMaterial(sh, profile)
+                            End If
                         End If
+                    Else
+                        Log("  No shells found in ShellManager")
                     End If
-                Catch
+                Catch ex As System.Exception
+                    Log("  Shell setup failed: " & ex.Message)
                 End Try
-                Log(String.Format("  *** Right-click Part in study -> Edit Definition -> accept {0}mm ***", profile.T))
-                Log("  *** Then right-click Mesh -> Create Mesh ***")
-                Log("  *** Then click 'Mesh + Run' ***")
+                If Not shellOK Then
+                    Log(String.Format("  *** MANUAL: Right-click Part -> Edit Definition -> accept {0}mm ***", profile.T))
+                End If
+                If Not shellMatOK Then
+                    Log("  *** MANUAL: Right-click Part -> Apply/Edit Material -> " & profile.MaterialName & " ***")
+                End If
 
                 ' ─── 3.4 Fixtures and loads ───
                 Log("")
@@ -1304,10 +1296,15 @@ Imports SolidWorks.Interop.cosworks
                             Try
                                 dispR.RestraintBeginEdit()
                                 ' Dir2 = Y = axial (Front Plane reference, Y is up)
-                                ' This matches the manual setup that worked in the previous session
-                                dispR.SetTranslationComponentsValues(0, 1, 0, 0.0, disp_m, 0.0)
+                                ' This matches the manual setup that worked in the previous session.
+                                ' Pull (-Y) is applied as a NEGATIVE value — equivalent to the
+                                ' manual 'Reverse direction' checkbox. Verify on first batch Pull
+                                ' run that Kms0 matches a prior manually-reversed Pull run.
+                                Dim dispSigned As Double = If(isPull, -disp_m, disp_m)
+                                dispR.SetTranslationComponentsValues(0, 1, 0, 0.0, dispSigned, 0.0)
                                 Dim endErr As Integer = dispR.RestraintEndEdit()
-                                Log(String.Format("  Prescribed disp: {0}mm Dir2=Y axial (err={1})", maxDisp_mm, endErr))
+                                Log(String.Format("  Prescribed disp: {0}mm Dir2=Y axial {1} (err={2})", _
+                                    maxDisp_mm, If(isPull, "PULL(-Y)", "PUSH(+Y)"), endErr))
                             Catch ex2 As System.Exception
                                 Log("  SetTranslation failed: " & ex2.Message)
                             End Try
@@ -1326,94 +1323,65 @@ Imports SolidWorks.Interop.cosworks
                 End Try
 
                 ' ─── 3.5 Study properties ───
+                ' All names below are VERIFIED against the SW2014 interop dump
+                ' (SimAPI_Members.txt): NonLinearStudyOptions, UseLargeDisplacement,
+                ' EndTime, FixedTimeIncrement (Double = step size), and
+                ' TimeIncrement (Int32 = stepping-method selector).
                 Log("")
                 Log("Setting study properties...")
                 Try
-                    Dim opts As Object = Nothing
-                    For Each pName As String In New String() { _
-                        "NonLinearStudyOptions", "NonlinearStudyOptions", _
-                        "StudyOptions", "StaticStudyOptions"}
-                        Try
-                            opts = CallByName(_study, pName, CallType.Get)
-                            If opts IsNot Nothing Then
-                                Log(String.Format("  Got options via: {0}", pName))
-                                Exit For
-                            End If
-                        Catch
-                        End Try
-                    Next
+                    Dim opts As CWNonLinearStudyOptions = _study.NonLinearStudyOptions
 
                     If opts IsNot Nothing Then
-                        For Each pName As String In New String() {"LargeDisplacement", "UseLargeDisplacement"}
-                            Try
-                                CallByName(opts, pName, CallType.Set, 1)
-                                Log(String.Format("  {0} = ON", pName))
-                                Exit For
-                            Catch
-                            End Try
-                        Next
-
                         Try
-                            CallByName(opts, "IncrementEndTimeValue", CallType.Set, 1.0)
-                            Log("  EndTime = 1.0")
-                        Catch
+                            opts.UseLargeDisplacement = 1
+                            Log("  UseLargeDisplacement = ON")
+                        Catch ex2 As System.Exception
+                            Log("  UseLargeDisplacement failed: " & ex2.Message)
                         End Try
 
-                        ' Set Fixed step size (value pre-loads into dialog)
+                        Try
+                            opts.EndTime = 1.0
+                            Log("  EndTime = 1.0")
+                        Catch ex2 As System.Exception
+                            Log("  EndTime failed: " & ex2.Message)
+                        End Try
+
+                        ' Step size (pre-loads the 'Fixed' increment value)
                         Dim stepSize As Double = 1.0 / CDbl(nSteps)
                         Try
-                            CallByName(opts, "FixedTimeIncrement", CallType.Set, stepSize)
+                            opts.FixedTimeIncrement = stepSize
                             Log(String.Format("  FixedTimeIncrement = {0:F6} ({1} steps)", stepSize, nSteps))
-                        Catch
+                        Catch ex2 As System.Exception
+                            Log("  FixedTimeIncrement failed: " & ex2.Message)
                         End Try
 
-                        ' Force FIXED stepping (disable autostepping) so the increment is honored.
-                        ' SW 2014 property name varies; try the known candidates and log which one takes.
-                        Dim autoOff As Boolean = False
-                        For Each aName As String In New String() { _
-                            "Autostepping", "AutoStepping", "UseAutostepping", _
-                            "AutomaticTimeStepping", "AutoTimeStepping"}
-                            Try
-                                CallByName(opts, aName, CallType.Set, 0)
-                                Log(String.Format("  Autostepping = OFF (via {0})", aName))
-                                autoOff = True
-                                Exit For
-                            Catch
-                            End Try
-                        Next
-
-                        If autoOff Then
-                            Log("  Stepping = FIXED (set automatically)")
-                        Else
-                            ' Could not set via API; surface the real property names, then fall back to manual.
-                            Try
-                                For Each m As MemberInfo In opts.GetType().GetMembers()
-                                    If m.MemberType = MemberTypes.Property Then
-                                        Dim nm As String = m.Name.ToLower()
-                                        If nm.Contains("step") OrElse nm.Contains("auto") Then
-                                            Log("    opts prop: " & m.Name)
-                                        End If
-                                    End If
-                                Next
-                            Catch
-                            End Try
-                            Log("  *** MANUAL: Study Properties -> click 'Fixed' radio -> OK ***")
-                        End If
-                    Else
-                        Log("  Could not find options. Enumerating study members...")
-                        Dim stType As Type = _study.GetType()
-                        For Each m As MemberInfo In stType.GetMembers()
-                            If m.MemberType = MemberTypes.Property Then
-                                Dim nm As String = m.Name.ToLower()
-                                If nm.Contains("option") OrElse nm.Contains("solver") OrElse _
-                                   nm.Contains("large") OrElse nm.Contains("step") OrElse _
-                                   nm.Contains("nonlin") Then
-                                    Log("    Prop: " & m.Name)
-                                End If
+                        ' Stepping-method selector. TimeIncrement is Int32; the public
+                        ' docs do not state which integer means Fixed vs Automatic.
+                        ' EMPIRICAL APPROACH: a fresh study defaults to Automatic, so we
+                        ' read the default, set the flipped binary value (= Fixed), and
+                        ' read back. The batch validator independently verifies fixed
+                        ' stepping by requiring CSV data-row count == requested steps.
+                        Try
+                            Dim tiBefore As Integer = opts.TimeIncrement
+                            Dim tiTarget As Integer = If(tiBefore = 0, 1, 0)
+                            opts.TimeIncrement = tiTarget
+                            Dim tiAfter As Integer = opts.TimeIncrement
+                            Log(String.Format("  TimeIncrement selector: default={0} -> set {1} -> read-back {2}", _
+                                tiBefore, tiTarget, tiAfter))
+                            If tiAfter = tiBefore Then
+                                Log("  WARNING: TimeIncrement did not change — verify 'Fixed' in Study Properties on run 1")
+                            Else
+                                Log("  Stepping flipped from study default (Automatic) -> FIXED")
                             End If
-                        Next
+                        Catch ex2 As System.Exception
+                            Log("  TimeIncrement failed: " & ex2.Message)
+                            Log("  *** MANUAL: Study Properties -> click 'Fixed' radio -> OK ***")
+                        End Try
+                    Else
+                        Log("  NonLinearStudyOptions returned Nothing")
                         Log("  *** SET MANUALLY: Study -> Properties ***")
-                        Log(String.Format("  Large displacement ON, {0} steps", nSteps))
+                        Log(String.Format("  Large displacement ON, Fixed, {0} steps", nSteps))
                     End If
                 Catch ex As System.Exception
                     Log("  Properties failed: " & ex.Message)
@@ -1431,27 +1399,467 @@ Imports SolidWorks.Interop.cosworks
         End Function
 
         ' ──────────────────────────────────────────────────────────────
+        ' Helper — resolve material database FULL PATHS.
+        ' SetLibraryMaterial requires the full path to the .sldmat file,
+        ' NOT the display name. (Display names were the prior failure mode.)
+        ' Custom DBs containing 'spider' or 'edge' are tried first.
+        ' ──────────────────────────────────────────────────────────────
+        Private _matDbPaths As List(Of String) = Nothing
+
+        Private Function ResolveMaterialDbPaths() As List(Of String)
+            If _matDbPaths IsNot Nothing Then Return _matDbPaths
+            Dim result As New List(Of String)()
+            Dim others As New List(Of String)()
+            Try
+                Dim dbs As Object = _swApp.GetMaterialDatabases()
+                If dbs IsNot Nothing Then
+                    For Each o As Object In DirectCast(dbs, Object())
+                        Dim p As String = TryCast(o, String)
+                        If String.IsNullOrEmpty(p) Then Continue For
+                        Dim low As String = p.ToLower()
+                        If low.Contains("spider") OrElse low.Contains("edge") Then
+                            result.Add(p)
+                        Else
+                            others.Add(p)
+                        End If
+                    Next
+                End If
+            Catch ex As System.Exception
+                Log("  GetMaterialDatabases failed: " & ex.Message)
+            End Try
+            result.AddRange(others)
+            ' Last-resort known default location
+            result.Add("C:\Program Files\SolidWorks Corp\SolidWorks\lang\english\sldmaterials\solidworks materials.sldmat")
+            Log(String.Format("  Material DBs resolved: {0}", result.Count))
+            For Each p As String In result
+                Log("    " & p)
+            Next
+            _matDbPaths = result
+            Return result
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Helper — SetLibraryMaterial on any cosworks target object,
+        ' iterating resolved full .sldmat paths. Returns True on success.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function ApplyLibraryMaterialTo(ByVal target As Object, _
+                                                ByVal profile As SpiderProfile, _
+                                                ByVal label As String) As Boolean
+            For Each dbPath As String In ResolveMaterialDbPaths()
+                Try
+                    Dim ret As Object = CallByName(target, "SetLibraryMaterial", CallType.Method, _
+                        dbPath, profile.MaterialName)
+                    Dim ok As Boolean = True
+                    Try
+                        If TypeOf ret Is Boolean Then ok = CBool(ret)
+                    Catch : End Try
+                    If ok Then
+                        Log(String.Format("  {0} SetLibraryMaterial OK: '{1}' from", label, profile.MaterialName))
+                        Log("    " & dbPath)
+                        Return True
+                    End If
+                Catch
+                End Try
+            Next
+            Log(String.Format("  {0} SetLibraryMaterial: no DB accepted '{1}'", label, profile.MaterialName))
+            Return False
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Shell material via library DB (typed, SW2014-verified signature:
+        ' SetLibraryMaterial(SLibraryPathName, SMaterialName) As Int32).
+        ' Success is judged by READ-BACK, not by the return code.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function ApplyShellLibraryMaterial(ByVal sh As CWShell, _
+                                                   ByVal profile As SpiderProfile) As Boolean
+            For Each dbPath As String In ResolveMaterialDbPaths()
+                Try
+                    Dim ret As Integer = sh.SetLibraryMaterial(dbPath, profile.MaterialName)
+                    If VerifyShellMaterial(sh, profile) Then
+                        Log(String.Format("  Shell SetLibraryMaterial '{0}' VERIFIED (ret={1}) from", _
+                            profile.MaterialName, ret))
+                        Log("    " & dbPath)
+                        Return True
+                    End If
+                Catch
+                End Try
+            Next
+            Log(String.Format("  Shell SetLibraryMaterial: no DB verified '{0}'", profile.MaterialName))
+            Return False
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Read back the shell material and verify it UNIT-INDEPENDENTLY:
+        '   - NUXY is dimensionless: must match profile.Nu
+        '   - GXY/EX must equal 1/(2(1+Nu)) regardless of unit system
+        '     (this is the stale-G hazard gate)
+        ' EX is logged raw for the human sanity check.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function VerifyShellMaterial(ByVal sh As CWShell, _
+                                             ByVal profile As SpiderProfile) As Boolean
+            Try
+                Dim mat As CWMaterial = sh.GetShellMaterial()
+                If mat Is Nothing Then
+                    Log("    read-back: GetShellMaterial returned Nothing")
+                    Return False
+                End If
+                Dim matName As String = ""
+                Try : matName = mat.MaterialName : Catch : End Try
+
+                Dim tdep As Integer = 0
+                Dim exV As Double = mat.GetPropertyByName(0, "EX", tdep)
+                Dim nuV As Double = mat.GetPropertyByName(0, "NUXY", tdep)
+                Dim gxV As Double = mat.GetPropertyByName(0, "GXY", tdep)
+                Log(String.Format("    read-back: '{0}'  EX={1:G6}  NUXY={2:F4}  GXY={3:G6}", _
+                    matName, exV, nuV, gxV))
+
+                If Math.Abs(nuV - profile.Nu) > 0.005 Then
+                    Log(String.Format("    Nu mismatch: read {0:F4} vs profile {1:F4}", nuV, profile.Nu))
+                    Return False
+                End If
+                If exV > 0.0 AndAlso gxV > 0.0 Then
+                    Dim ratio As Double = gxV / exV
+                    Dim expected As Double = 1.0 / (2.0 * (1.0 + nuV))
+                    Dim rel As Double = Math.Abs(ratio - expected) / expected
+                    If rel > 0.02 Then
+                        Log(String.Format("    STALE-G: G/E={0:F4} expected {1:F4} ({2:F1}% off)", _
+                            ratio, expected, rel * 100.0))
+                        Return False
+                    End If
+                    Log(String.Format("    G/E ratio OK: {0:F4} (expected {1:F4})", ratio, expected))
+                Else
+                    Log("    EX/GXY read-back non-positive — cannot verify G")
+                    Return False
+                End If
+                Return True
+            Catch ex As System.Exception
+                Log("    read-back failed: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Fallback — custom in-code shell material with EXPLICIT E/Nu/G/Density.
+        ' Sets G = E/(2(1+Nu)) directly — immune to the stale-G card hazard.
+        ' Typed calls verified against the SW2014 interop dump:
+        '   GetDefaultMaterial() As CWMaterial
+        '   SetPropertyByName(SName, DValue, BValue As Int32)
+        '   SetShellMaterial(MaterialDisp) As Int32
+        ' UNIT ASSUMPTION (flagged): profile.E is MPa -> EX passed as N/m^2
+        ' (E*1e6) with MaterialUnits=0. Verified on run 1 via the Kms0 gate;
+        ' a wrong unit system is off by orders of magnitude and unmissable.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function ApplyCustomShellMaterial(ByVal sh As CWShell, _
+                                                  ByVal profile As SpiderProfile) As Boolean
+            Try
+                Log("  Trying custom in-code material (explicit E/Nu/G/Density)...")
+                Dim mat As CWMaterial = sh.GetDefaultMaterial()
+                If mat Is Nothing Then
+                    Log("    GetDefaultMaterial returned Nothing")
+                    Return False
+                End If
+
+                Dim E_SI As Double = profile.E * 1000000.0          ' MPa -> N/m^2
+                Dim G_SI As Double = E_SI / (2.0 * (1.0 + profile.Nu))
+
+                Try : mat.MaterialName = profile.MaterialName & "_auto" : Catch : End Try
+                Try : mat.MaterialUnits = 0 : Catch : End Try
+
+                Try
+                    mat.SetPropertyByName("EX", E_SI, 0)
+                    mat.SetPropertyByName("NUXY", profile.Nu, 0)
+                    mat.SetPropertyByName("GXY", G_SI, 0)
+                    mat.SetPropertyByName("DENS", profile.Density, 0)
+                    Log(String.Format("    set EX={0:G6} NUXY={1:F4} GXY={2:G6} DENS={3}", _
+                        E_SI, profile.Nu, G_SI, profile.Density))
+                Catch ex As System.Exception
+                    Log("    SetPropertyByName failed: " & ex.Message)
+                    Return False
+                End Try
+
+                sh.ShellBeginEdit()
+                Dim ret As Integer = -999
+                Try
+                    ret = sh.SetShellMaterial(DirectCast(mat, Object))
+                Catch ex As System.Exception
+                    Log("    SetShellMaterial failed: " & ex.Message)
+                End Try
+                Try : sh.ShellEndEdit() : Catch : End Try
+
+                Dim verified As Boolean = VerifyShellMaterial(sh, profile)
+                Log(String.Format("    custom material: SetShellMaterial ret={0}, verified={1}", ret, verified))
+                Return verified
+            Catch ex As System.Exception
+                Log("  Custom material failed: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Helper — IDispatch invoke with ByRef out-args (CallByName can't
+        ' return ByRef values; InvokeMember on __ComObject can).
+        ' ──────────────────────────────────────────────────────────────
+        Private Function InvokeByRef(ByVal target As Object, ByVal name As String, _
+                                     ByRef args() As Object) As Object
+            Return target.GetType().InvokeMember(name, _
+                BindingFlags.InvokeMethod, Nothing, target, args)
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Create FINEST standard mesh, high-quality (quadratic) elements.
+        ' Standard mesher is the permanent campaign standard (curvature-based
+        ' caused ~10x stiffness reduction on shells). Finest = 0.5x default
+        ' global element size. Falls back to RunAnalysis auto-mesh on failure.
+        ' ──────────────────────────────────────────────────────────────
+        Public Function CreateFinestMesh() As Boolean
+            If Not ReconnectStudy() Then Return False
+            Try
+                Dim mesh As CWMesh = _study.Mesh
+                If mesh Is Nothing Then
+                    Log("  No CWMesh object — auto-mesh fallback")
+                    Return False
+                End If
+
+                ' Typed, SW2014-verified: MesherType / Quality / 
+                ' GetDefaultElementSizeAndTolerance / Study.CreateMesh
+                Try
+                    mesh.MesherType = 0          ' standard mesher (campaign standard)
+                    Log("  mesh.MesherType = 0 (standard)")
+                Catch ex As System.Exception
+                    Log("  MesherType set failed: " & ex.Message)
+                End Try
+                Try
+                    mesh.Quality = 1             ' high quality (quadratic)
+                    Log("  mesh.Quality = 1 (high/quadratic)")
+                Catch ex As System.Exception
+                    Log("  Quality set failed: " & ex.Message)
+                End Try
+
+                Dim unit As Integer = CInt(swsLinearUnit_e.swsLinearUnitMillimeters)
+                Dim elSize As Double = 0.0
+                Dim tol As Double = 0.0
+                Try
+                    mesh.GetDefaultElementSizeAndTolerance(unit, elSize, tol)
+                    Log(String.Format("  Default mesh: el={0:F4}mm tol={1:F5}mm", elSize, tol))
+                Catch ex As System.Exception
+                    Log("  GetDefaultElementSizeAndTolerance failed: " & ex.Message)
+                    Return False
+                End Try
+                If elSize <= 0.0 Then
+                    Log("  Default element size non-positive — auto-mesh fallback")
+                    Return False
+                End If
+
+                Dim fineEl As Double = elSize * 0.5
+                Dim fineTol As Double = tol * 0.5
+                Log(String.Format("  Creating FINEST mesh: el={0:F4}mm tol={1:F5}mm ...", fineEl, fineTol))
+                Try
+                    Dim meshErr As Integer = _study.CreateMesh(unit, fineEl, fineTol)
+                    Log(String.Format("  CreateMesh returned {0}", meshErr))
+                    Try
+                        Log(String.Format("  Mesh: {0} nodes, {1} elements", _
+                            mesh.NodeCount, mesh.ElementCount))
+                    Catch : End Try
+                    Return (meshErr = 0)
+                Catch ex As System.Exception
+                    Log("  CreateMesh failed: " & ex.Message)
+                    Return False
+                End Try
+            Catch ex As System.Exception
+                Log("  CreateFinestMesh: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Diagnostic — dump ALL Simulation interop type members to a file.
+        ' Reflects the cosworks interop assembly METADATA (not the COM RCW),
+        ' so this gives the exact SW2014 property/method names for shell
+        ' material assignment, nonlinear stepping flags, mesh control, etc.
+        ' ──────────────────────────────────────────────────────────────
+        Public Sub DumpSimApiMembers(ByVal outPath As String)
+            Try
+                Dim asmCos As System.Reflection.Assembly = GetType(CWStudy).Assembly
+                Dim keys() As String = New String() { _
+                    "shell", "material", "mesh", "nonlinear", "studyoptions", _
+                    "restraint", "results", "study"}
+                Dim sb As New StringBuilder()
+                sb.AppendLine("SolidWorks Simulation interop member dump")
+                sb.AppendLine("Assembly: " & asmCos.FullName)
+                sb.AppendLine("Generated: " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))
+                sb.AppendLine(New String("="c, 70))
+                For Each t As Type In asmCos.GetTypes()
+                    Dim tn As String = t.Name.ToLower()
+                    Dim match As Boolean = False
+                    For Each k As String In keys
+                        If tn.Contains(k) Then match = True : Exit For
+                    Next
+                    If Not match Then Continue For
+                    If Not t.IsInterface Then Continue For
+                    sb.AppendLine()
+                    sb.AppendLine("TYPE: " & t.Name)
+                    sb.AppendLine(New String("-"c, 50))
+                    For Each m As MemberInfo In t.GetMembers()
+                        Select Case m.MemberType
+                            Case MemberTypes.Property
+                                Dim pi As PropertyInfo = DirectCast(m, PropertyInfo)
+                                sb.AppendLine(String.Format("  PROP   {0} : {1}{2}{3}", _
+                                    pi.Name, pi.PropertyType.Name, _
+                                    If(pi.CanRead, " get", ""), If(pi.CanWrite, " set", "")))
+                            Case MemberTypes.Method
+                                Dim mi As MethodInfo = DirectCast(m, MethodInfo)
+                                If mi.IsSpecialName Then Continue For
+                                Dim ps As New StringBuilder()
+                                For Each p As ParameterInfo In mi.GetParameters()
+                                    If ps.Length > 0 Then ps.Append(", ")
+                                    ps.Append(If(p.ParameterType.IsByRef, "ByRef ", ""))
+                                    ps.Append(p.Name & " As " & p.ParameterType.Name.Replace("&", ""))
+                                Next
+                                sb.AppendLine(String.Format("  METHOD {0}({1}) : {2}", _
+                                    mi.Name, ps.ToString(), mi.ReturnType.Name))
+                        End Select
+                    Next
+                Next
+                System.IO.File.WriteAllText(outPath, sb.ToString())
+                Log("Sim API member dump written: " & outPath)
+            Catch ex As System.Exception
+                Log("DumpSimApiMembers failed: " & ex.Message)
+            End Try
+        End Sub
+
+        ' ──────────────────────────────────────────────────────────────
+        ' SolidWorks process lifecycle — for unattended batch operation.
+        ' SW2014 accumulates memory over long COM sessions; the batch
+        ' engine restarts it every N runs.
+        ' ──────────────────────────────────────────────────────────────
+        Public Function ConnectOrStart() As Boolean
+            If Connect() Then Return True
+            Log("Starting new SolidWorks instance...")
+            Try
+                _swApp = DirectCast(CreateObject("SldWorks.Application"), SldWorks)
+                If _swApp Is Nothing Then
+                    Log("ERROR: CreateObject SldWorks failed.")
+                    Return False
+                End If
+                _swApp.Visible = True
+                ' Give the add-ins (Simulation) time to load
+                System.Threading.Thread.Sleep(8000)
+                Log("SolidWorks started: " & _swApp.RevisionNumber())
+                Return True
+            Catch ex As System.Exception
+                Log("ERROR starting SolidWorks: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        Public Sub ShutdownSolidWorks()
+            Try
+                _study = Nothing : _cwDoc = Nothing : _cw = Nothing
+                _idEdge = Nothing : _odEdge = Nothing
+                If _model IsNot Nothing Then
+                    Try : _swApp.CloseDoc(_model.GetPathName()) : Catch : End Try
+                    _model = Nothing
+                End If
+                If _swApp IsNot Nothing Then
+                    Try : _swApp.CloseAllDocuments(True) : Catch : End Try
+                    Try : _swApp.ExitApp() : Catch : End Try
+                End If
+            Catch : End Try
+            _swApp = Nothing
+            Try
+                System.Runtime.InteropServices.Marshal.CleanupUnusedObjectsInCurrentContext()
+                GC.Collect()
+                GC.WaitForPendingFinalizers()
+            Catch : End Try
+            ' Hard-kill any remaining SLDWORKS process after a grace period
+            System.Threading.Thread.Sleep(5000)
+            Try
+                For Each pr As System.Diagnostics.Process In _
+                    System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
+                    Try
+                        If Not pr.WaitForExit(20000) Then
+                            Log("  Killing SLDWORKS pid " & pr.Id)
+                            pr.Kill()
+                        End If
+                    Catch : End Try
+                Next
+            Catch : End Try
+            Log("SolidWorks shut down.")
+        End Sub
+
+        Public Function RestartSolidWorks() As Boolean
+            Log("── Restarting SolidWorks (memory hygiene) ──")
+            ShutdownSolidWorks()
+            System.Threading.Thread.Sleep(3000)
+            Return ConnectOrStart()
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Best-effort view captures for batch runs (.jpg). Captures the
+        ' CURRENT display state (post-run this is typically the active
+        ' result plot). Side (*Front) and Top (*Top) views.
+        ' ──────────────────────────────────────────────────────────────
+        Public Sub SaveViewImages(ByVal basePathNoSuffix As String)
+            If _model Is Nothing Then Return
+            Try
+                SaveOneView("*Front", basePathNoSuffix & "_side_stepLast.jpg")
+                SaveOneView("*Top", basePathNoSuffix & "_top_stepLast.jpg")
+                SaveOneView("*Front", "")   ' restore side view
+            Catch ex As System.Exception
+                Log("  View capture failed: " & ex.Message)
+            End Try
+        End Sub
+
+        Private Sub SaveOneView(ByVal viewName As String, ByVal jpgPath As String)
+            Try
+                _model.ShowNamedView2(viewName, -1)
+                _model.ViewZoomtofit2()
+                System.Windows.Forms.Application.DoEvents()
+                If jpgPath.Length = 0 Then Return
+                Dim bmpPath As String = jpgPath & ".tmp.bmp"
+                If _model.SaveBMP(bmpPath, 0, 0) Then
+                    Try
+                        Using bmp As System.Drawing.Bitmap = New System.Drawing.Bitmap(bmpPath)
+                            bmp.Save(jpgPath, System.Drawing.Imaging.ImageFormat.Jpeg)
+                        End Using
+                        Log("  JPG: " & jpgPath)
+                    Catch ex As System.Exception
+                        Log("  BMP->JPG convert failed: " & ex.Message)
+                    End Try
+                    Try : System.IO.File.Delete(bmpPath) : Catch : End Try
+                End If
+            Catch ex As System.Exception
+                Log("  SaveOneView(" & viewName & "): " & ex.Message)
+            End Try
+        End Sub
+
+        ' ──────────────────────────────────────────────────────────────
         ' STEP 4 — Mesh and Run
         ' ──────────────────────────────────────────────────────────────
         Public Function MeshAndRun() As Boolean
             If Not ReconnectStudy() Then Return False
 
             Try
-                Log("Running study (will auto-mesh if needed)...")
+                ' Explicit FINEST standard high-quality mesh (campaign standard).
+                ' On failure, fall back to RunAnalysis auto-mesh (legacy behavior).
+                Dim meshed As Boolean = CreateFinestMesh()
+                If Not meshed Then
+                    Log("  Finest-mesh creation unavailable — RunAnalysis will auto-mesh")
+                    Log("  (run 'Dump Sim API' to lock the SW2014 mesh call names)")
+                End If
+
                 Dim mesh As CWMesh = _study.Mesh
                 If mesh IsNot Nothing Then
                     Try
                         If mesh.NodeCount > 0 Then
-                            Log(String.Format("  Existing mesh: {0} nodes", mesh.NodeCount))
-                        Else
-                            Log("  No mesh yet — RunAnalysis will create one")
+                            Log(String.Format("  Mesh ready: {0} nodes", mesh.NodeCount))
                         End If
                     Catch
                         Log("  Mesh state unknown — proceeding to run")
                     End Try
                 End If
 
-                Log("Running study (auto-meshes then solves)...")
+                Log("Running study (solves; auto-meshes if no mesh)...")
                 Try
                     Dim runErr As Integer = _study.RunAnalysis()
                     Log(String.Format("RunAnalysis complete (err={0})", runErr))
