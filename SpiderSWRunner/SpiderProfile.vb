@@ -380,9 +380,18 @@ Imports System.Text
                     hNaturals(idx) = 0.0
                 End If
 
-                ' Determine effective H for this roll
+                ' Determine effective H for this roll.
+                ' Under natH, the natural height is the BASELINE and taper scales
+                ' it per roll (hScale_n: inner=1-taper, outer=1). At taper=0 this
+                ' reduces exactly to hNaturals — all prior natH runs unaffected.
+                ' (Fix 2026-06-11: previously taper was silently discarded under
+                ' natH, producing identical geometry across the whole taper spine.)
+                ' GEOMETRY DEFINITION (confirm with SpiderDesigner before rerun):
+                ' a tapered roll = vertically scaled natural ArcLines/SineLines
+                ' roll — the generator scales z by h/H_geom; plan-view pitch and
+                ' connector angle are preserved, arc shape compresses vertically.
                 If UseNaturalH AndAlso (ProfileType = 2 OrElse ProfileType = 3) Then
-                    hEffRolls(idx) = hNaturals(idx)
+                    hEffRolls(idx) = hNaturals(idx) * hScale_n
                 Else
                     hEffRolls(idx) = h_tapered
                 End If

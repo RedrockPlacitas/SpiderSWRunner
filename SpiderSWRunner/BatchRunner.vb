@@ -22,7 +22,11 @@ Imports Microsoft.VisualBasic
 
 Public Class BatchRunner
 
-    Public Const CrestR_Tol_mm As Double = 0.5     ' check 1 tolerance (nearest-node)
+    ' Crest R gate guards against gross geometry errors (wrong T shifts crests
+    ' by ~half a pitch, mm-scale). Nearest-node quantization with the finest
+    ' standard mesh (~3.3mm elements) produces offsets up to ~0.7mm on valid
+    ' runs (verified 2026-06-11), so the tolerance is 1.0mm.
+    Public Const CrestR_Tol_mm As Double = 1.0     ' check 1 tolerance (nearest-node)
     Public Const CrestY_Tol_mm As Double = 0.05    ' check 2 tolerance (memory rule)
     Public Const KmsPair_Tol As Double = 0.01      ' check 3: 1%
 
@@ -155,7 +159,8 @@ Public Class BatchRunner
                     r.PrecheckNote = "DUPLICATE of RunID " & namesSeen(r.OutputFile)
                 Else
                     namesSeen(r.OutputFile) = r.RunID
-                    If r.Status <> "PASS" AndAlso System.IO.File.Exists(r.OutputFile) Then
+                    If r.Status <> "PASS" AndAlso r.Status <> "PARTIAL" AndAlso _
+                       System.IO.File.Exists(r.OutputFile) Then
                         r.PrecheckPass = False
                         r.PrecheckNote = "FILE EXISTS: " & r.OutputFile
                     End If
@@ -213,8 +218,8 @@ Public Class BatchRunner
             Dim r As BatchRow = rows(i)
             If Progress IsNot Nothing Then Progress(i, rows.Count, r)
 
-            If r.Status = "PASS" Then
-                Log(String.Format("Run {0}: already PASS — skipping (resume)", r.RunID))
+            If r.Status = "PASS" OrElse r.Status = "PARTIAL" Then
+                Log(String.Format("Run {0}: already {1} — skipping (resume)", r.RunID, r.Status))
                 Continue For
             End If
             If Not r.PrecheckPass Then
@@ -254,22 +259,27 @@ Public Class BatchRunner
                 End If
             End If
 
-            ' Best-effort view captures (.jpg)
-            If ok Then
-                Try
-                    _sw.SaveViewImages(r.OutputFile.Replace("_auto.csv", ""))
-                Catch : End Try
-            End If
+            ' (View JPG captures removed by request 2026-06-11 — the CSV pair
+            ' per direction carries profiles and stress; images added no value.)
 
-            ' 4-point validation
+            ' 4-point validation (+ stepping/completion)
             Dim vNotes As String = ""
+            Dim isPartial As Boolean = False
             If ok Then
-                ok = ValidateAutoCsv(r, p, rows, vNotes)
+                ok = ValidateAutoCsv(r, p, rows, vNotes, isPartial)
                 If Not ok Then failStage = "Validation"
             End If
 
             Dim dt As TimeSpan = DateTime.Now - t0
-            If ok Then
+            If ok AndAlso isPartial Then
+                ' Gates passed but the solver terminated before full stroke.
+                ' Data up to the stop is valid; the row is terminal (rerunning
+                ' reproduces the same ceiling) and does not block the batch.
+                r.Status = "PARTIAL"
+                r.Message = String.Format("{0:F1} min. {1}", dt.TotalMinutes, vNotes)
+                passCount += 1
+                Log(String.Format("Run {0}: PARTIAL ({1:F1} min)  {2}", r.RunID, dt.TotalMinutes, vNotes))
+            ElseIf ok Then
                 r.Status = "PASS"
                 r.Message = String.Format("{0:F1} min. {1}", dt.TotalMinutes, vNotes)
                 passCount += 1
@@ -334,8 +344,10 @@ Public Class BatchRunner
     ' ──────────────────────────────────────────────────────────────
     Public Function ValidateAutoCsv(ByVal r As BatchRow, ByVal p As SpiderProfile, _
                                     ByVal allRows As List(Of BatchRow), _
-                                    ByRef notes As String) As Boolean
+                                    ByRef notes As String, _
+                                    ByRef isPartial As Boolean) As Boolean
         Dim pass As Boolean = True
+        isPartial = False
         Dim sb As New StringBuilder()
         Try
             If Not System.IO.File.Exists(r.OutputFile) Then
@@ -349,6 +361,7 @@ Public Class BatchRunner
             Dim crestYLine As String = ""
             Dim firstData As String = ""
             Dim dataRowCount As Integer = 0
+            Dim timeFracs As New List(Of Double)()
             For Each ln As String In lines
                 If ln.StartsWith("# ID=") Then hdrGeom = ln
                 If ln.StartsWith("# Crest node R") Then crestRLine = ln
@@ -356,17 +369,39 @@ Public Class BatchRunner
                 If ln.Length > 0 AndAlso Not ln.StartsWith("#") AndAlso Not ln.StartsWith("Step,") Then
                     dataRowCount += 1
                     If firstData.Length = 0 Then firstData = ln
+                    Dim ff() As String = ln.Split(","c)
+                    If ff.Length > 1 Then
+                        Dim tfv As Double
+                        If Double.TryParse(ff(1).Trim(), tfv) Then timeFracs.Add(tfv)
+                    End If
                 End If
             Next
 
-            ' ── Check 5: fixed-stepping verification ──
-            ' If autostepping were active, the solver's step count would not
-            ' equal the requested count. This is the empirical gate behind the
-            ' TimeIncrement selector encoding.
-            If dataRowCount <> r.Steps Then
+            ' ── Check 5: stepping uniformity + run completion (two distinct causes) ──
+            ' 5a: step-size uniformity proves FIXED stepping (autostepping detector)
+            ' 5b: last time_frac < 1.0 means the solver TERMINATED EARLY — data up
+            '     to the stop is valid; this is reported as PARTIAL, not stepping
+            '     failure (cf. SineLines A60 geometry-physical solver ceiling).
+            Dim expectedStep As Double = 1.0 / CDbl(r.Steps)
+            If timeFracs.Count >= 2 Then
+                Dim maxDev As Double = 0.0
+                For i As Integer = 1 To timeFracs.Count - 1
+                    Dim dv As Double = Math.Abs((timeFracs(i) - timeFracs(i - 1)) - expectedStep)
+                    If dv > maxDev Then maxDev = dv
+                Next
+                If maxDev > 0.000001 Then
+                    pass = False
+                    sb.Append(String.Format("[5a]non-uniform steps (max dev {0:G3}, autostepping?) ", maxDev))
+                End If
+            End If
+            If timeFracs.Count > 0 AndAlso timeFracs(timeFracs.Count - 1) < 0.999 Then
+                isPartial = True
+                Dim xStop As Double = timeFracs(timeFracs.Count - 1) * r.MaxDisp
+                sb.Append(String.Format("[5b]SOLVER STOPPED at step {0}/{1}, X={2:F2}mm of {3}mm (possible geometry-physical ceiling) ", _
+                    dataRowCount, r.Steps, xStop, r.MaxDisp))
+            ElseIf dataRowCount <> r.Steps Then
                 pass = False
-                sb.Append(String.Format("[5]rows {0} <> steps {1} (stepping NOT fixed?) ", _
-                    dataRowCount, r.Steps))
+                sb.Append(String.Format("[5]rows {0} <> steps {1} ", dataRowCount, r.Steps))
             End If
 
             ' ── Check 1: Crest R vs expected geometry ──
@@ -430,7 +465,8 @@ Public Class BatchRunner
                     Exit For
                 End If
             Next
-            If mate IsNot Nothing AndAlso mate.Status = "PASS" AndAlso _
+            If mate IsNot Nothing AndAlso _
+               (mate.Status = "PASS" OrElse mate.Status = "PARTIAL") AndAlso _
                System.IO.File.Exists(mate.OutputFile) Then
                 Dim mateKms As Double = ParseKms0FromFile(mate.OutputFile)
                 If kms0 > 0 AndAlso mateKms > 0 Then

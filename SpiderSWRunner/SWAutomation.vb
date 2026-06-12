@@ -1,7 +1,9 @@
 Imports System
 Imports System.Collections.Generic
 Imports System.Reflection
+Imports System.Runtime.InteropServices
 Imports System.Text
+Imports System.Threading
 Imports Microsoft.VisualBasic
 Imports Microsoft.VisualBasic.CompilerServices
 Imports SolidWorks.Interop.sldworks
@@ -788,13 +790,43 @@ Imports SolidWorks.Interop.cosworks
             Try
                 Dim cb As CwAddincallback = DirectCast( _
                     _swApp.GetAddInObject("CosmosWorks.CosmosWorks"), CwAddincallback)
+                If cb Is Nothing Then Return False
                 _cw = cb.CosmosWorks
+                If _cw Is Nothing Then Return False
                 Log("CosmosWorks connected")
                 Return True
             Catch ex As System.Exception
-                Log("ERROR getting CosmosWorks: " & ex.Message)
                 Return False
             End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Simulation add-in loads LAZILY after a fresh SolidWorks start —
+        ' GetAddInObject fails for tens of seconds on a new instance.
+        ' Retry with patience instead of failing the run (the cause of the
+        ' first restart-test SetupStudy failure, 2026-06-11).
+        ' ──────────────────────────────────────────────────────────────
+        Private Function GetCosmosRetry(ByVal timeoutSec As Integer) As Boolean
+            Dim t0 As DateTime = DateTime.Now
+            Dim attempt As Integer = 0
+            Do
+                attempt += 1
+                If GetCosmos() Then
+                    If attempt > 1 Then
+                        Log(String.Format("  (Simulation add-in ready after {0:F0}s, attempt {1})", _
+                            (DateTime.Now - t0).TotalSeconds, attempt))
+                    End If
+                    Return True
+                End If
+                If (DateTime.Now - t0).TotalSeconds >= timeoutSec Then
+                    Log(String.Format("ERROR: Simulation add-in not available after {0}s. " & _
+                        "Check Tools -> Add-Ins -> SolidWorks Simulation (set 'Start Up' too).", timeoutSec))
+                    Return False
+                End If
+                If attempt = 1 Then Log("  Waiting for Simulation add-in to load...")
+                System.Threading.Thread.Sleep(5000)
+                System.Windows.Forms.Application.DoEvents()
+            Loop
         End Function
 
         ' ──────────────────────────────────────────────────────────────
@@ -807,7 +839,7 @@ Imports SolidWorks.Interop.cosworks
                     Log("ERROR: Not connected to SolidWorks.")
                     Return False
                 End If
-                If Not GetCosmos() Then Return False
+                If Not GetCosmosRetry(120) Then Return False
                 _cwDoc = _cw.ActiveDoc
                 If _cwDoc Is Nothing Then
                     Log("ERROR: No active Simulation doc.")
@@ -926,7 +958,7 @@ Imports SolidWorks.Interop.cosworks
                 _cw = Nothing
                 _cwDoc = Nothing
                 _study = Nothing
-                If Not GetCosmos() Then Return False
+                If Not GetCosmosRetry(120) Then Return False
                 _cwDoc = _cw.ActiveDoc
                 If _cwDoc Is Nothing Then
                     Log("ERROR: Simulation has no active doc.")
@@ -1733,23 +1765,41 @@ Imports SolidWorks.Interop.cosworks
         ' engine restarts it every N runs.
         ' ──────────────────────────────────────────────────────────────
         Public Function ConnectOrStart() As Boolean
-            If Connect() Then Return True
-            Log("Starting new SolidWorks instance...")
-            Try
-                _swApp = DirectCast(CreateObject("SldWorks.Application"), SldWorks)
-                If _swApp Is Nothing Then
-                    Log("ERROR: CreateObject SldWorks failed.")
+            Dim connected As Boolean = Connect()
+            If Not connected Then
+                ' No healthy registered instance answered. Any SLDWORKS process
+                ' still present is a zombie (e.g. from a hard kill) and will
+                ' block COM activation of a new instance — sweep it first.
+                Try
+                    For Each pr As System.Diagnostics.Process In _
+                        System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
+                        Try
+                            Log("  Killing stale SLDWORKS pid " & pr.Id)
+                            pr.Kill()
+                            pr.WaitForExit(10000)
+                        Catch : End Try
+                    Next
+                Catch : End Try
+                System.Threading.Thread.Sleep(2000)
+
+                Log("Starting new SolidWorks instance...")
+                Try
+                    _swApp = DirectCast(CreateObject("SldWorks.Application"), SldWorks)
+                    If _swApp Is Nothing Then
+                        Log("ERROR: CreateObject SldWorks failed.")
+                        Return False
+                    End If
+                    _swApp.Visible = True
+                    Log("SolidWorks started: " & _swApp.RevisionNumber())
+                    connected = True
+                Catch ex As System.Exception
+                    Log("ERROR starting SolidWorks: " & ex.Message)
                     Return False
-                End If
-                _swApp.Visible = True
-                ' Give the add-ins (Simulation) time to load
-                System.Threading.Thread.Sleep(8000)
-                Log("SolidWorks started: " & _swApp.RevisionNumber())
-                Return True
-            Catch ex As System.Exception
-                Log("ERROR starting SolidWorks: " & ex.Message)
-                Return False
-            End Try
+                End Try
+            End If
+            ' Do not declare readiness until the Simulation add-in answers —
+            ' a fresh instance loads it lazily, long after the window appears.
+            Return GetCosmosRetry(120)
         End Function
 
         Public Sub ShutdownSolidWorks()
@@ -1834,6 +1884,100 @@ Imports SolidWorks.Interop.cosworks
         End Sub
 
         ' ──────────────────────────────────────────────────────────────
+        ' DIALOG WATCHDOG — auto-dismisses modal solver popups during
+        ' RunAnalysis (e.g. "Solution failure in a Step>1" at a buckling /
+        ' limit point) so unattended batches don't freeze. Enumerates
+        ' top-level dialog windows and posts Enter (default = OK), keeping
+        ' whatever steps converged. Pure Win32, no SW enum dependency.
+        ' ──────────────────────────────────────────────────────────────
+        ' Win32 (Declare syntax — robust on VS2010/.NET4)
+        Private Declare Auto Function EnumWindows Lib "user32.dll" ( _
+            ByVal cb As EnumWindowsProc, ByVal l As IntPtr) As Boolean
+        Private Declare Auto Function GetWindowThreadProcessId Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr, ByRef pid As Integer) As Integer
+        Private Declare Auto Function GetClassName Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr, ByVal sb As System.Text.StringBuilder, ByVal max As Integer) As Integer
+        Private Declare Auto Function IsWindowVisible Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr) As Boolean
+        Private Declare Auto Function PostMessage Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr, ByVal msg As Integer, _
+            ByVal wParam As IntPtr, ByVal lParam As IntPtr) As Boolean
+        Private Delegate Function EnumWindowsProc(ByVal hWnd As IntPtr, ByVal l As IntPtr) As Boolean
+
+        Private Const WM_KEYDOWN As Integer = &H100
+        Private Const WM_KEYUP As Integer = &H101
+        Private Const VK_RETURN As Integer = &HD
+
+        Private _watchdog As Thread = Nothing
+        Private _watchdogRun As Boolean = False
+        Private _watchdogDismissals As Integer = 0
+        Private _swProcessId As Integer = 0
+
+        Private Sub StartDialogWatchdog()
+            _watchdogDismissals = 0
+            _swProcessId = 0
+            Try
+                ' Resolve the SLDWORKS process id once so the watchdog only
+                ' touches dialogs owned by SolidWorks, never our own app.
+                For Each pr As System.Diagnostics.Process In _
+                    System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
+                    _swProcessId = pr.Id
+                    Exit For
+                Next
+            Catch
+            End Try
+            _watchdogRun = True
+            _watchdog = New Thread(AddressOf WatchdogLoop)
+            _watchdog.IsBackground = True
+            _watchdog.Start()
+        End Sub
+
+        Private Sub StopDialogWatchdog()
+            _watchdogRun = False
+            Try
+                If _watchdog IsNot Nothing Then _watchdog.Join(3000)
+            Catch
+            End Try
+            _watchdog = Nothing
+        End Sub
+
+        Private Sub WatchdogLoop()
+            ' Poll ~1s. Buckling raises TWO dialogs in sequence ("Solution
+            ' failure..." then "Program aborted. Press ENTER..."); a 1s cycle
+            ' catches both. Each #32770 owned by SLDWORKS gets an Enter posted.
+            While _watchdogRun
+                Try
+                    EnumWindows(AddressOf WatchdogEnum, IntPtr.Zero)
+                Catch
+                End Try
+                Dim waited As Integer = 0
+                While _watchdogRun AndAlso waited < 1000
+                    Thread.Sleep(200)
+                    waited += 200
+                End While
+            End While
+        End Sub
+
+        Private Function WatchdogEnum(ByVal hWnd As IntPtr, ByVal l As IntPtr) As Boolean
+            Try
+                If Not IsWindowVisible(hWnd) Then Return True
+                Dim pid As Integer = 0
+                GetWindowThreadProcessId(hWnd, pid)
+                If _swProcessId <> 0 AndAlso pid <> _swProcessId Then Return True
+                Dim cn As New System.Text.StringBuilder(256)
+                GetClassName(hWnd, cn, 256)
+                If cn.ToString() = "#32770" Then
+                    ' Standard Windows dialog box owned by SolidWorks — dismiss.
+                    PostMessage(hWnd, WM_KEYDOWN, New IntPtr(VK_RETURN), IntPtr.Zero)
+                    PostMessage(hWnd, WM_KEYUP, New IntPtr(VK_RETURN), IntPtr.Zero)
+                    _watchdogDismissals += 1
+                End If
+            Catch
+            End Try
+            Return True
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
         ' STEP 4 — Mesh and Run
         ' ──────────────────────────────────────────────────────────────
         Public Function MeshAndRun() As Boolean
@@ -1861,14 +2005,42 @@ Imports SolidWorks.Interop.cosworks
 
                 Log("Running study (solves; auto-meshes if no mesh)...")
                 Try
-                    Dim runErr As Integer = _study.RunAnalysis()
-                    Log(String.Format("RunAnalysis complete (err={0})", runErr))
+                    ' Buckling/limit points raise a modal "Solution failure in a
+                    ' Step>1" dialog that blocks RunAnalysis until dismissed —
+                    ' fatal to unattended batches. A watchdog thread auto-clicks
+                    ' it (Enter = default OK). Per the chosen policy we DISMISS
+                    ' and keep whatever steps converged (PARTIAL), rather than
+                    ' pushing through the instability. Partial results are saved
+                    ' by the solver and the validator flags the early stop.
+                    StartDialogWatchdog()
+                    Dim runErr As Integer = 0
+                    Try
+                        runErr = _study.RunAnalysis()
+                    Finally
+                        ' Keep dismissing for a few seconds after the call
+                        ' unwinds — the "Program aborted. Press ENTER to go
+                        ' back to preprocessor" dialog can land right as
+                        ' RunAnalysis returns.
+                        Dim tEnd As DateTime = DateTime.Now.AddSeconds(5)
+                        While DateTime.Now < tEnd
+                            System.Windows.Forms.Application.DoEvents()
+                            Thread.Sleep(250)
+                        End While
+                        StopDialogWatchdog()
+                    End Try
+                    Log(String.Format("RunAnalysis complete (err={0}){1}", _
+                        runErr, If(_watchdogDismissals > 0, _
+                        String.Format("  [watchdog dismissed {0} solver dialog(s) — likely buckling/limit point]", _watchdogDismissals), "")))
                     If runErr <> 0 Then
-                        Log("WARNING: err<>0. Check SolidWorks.")
-                        Log("If mesh failed: right-click Mesh -> Create Mesh, then re-run.")
+                        Log("WARNING: err<>0 (often the buckling stop itself — check the response).")
                     End If
-                    Return (runErr = 0)
+                    ' err<>0 with watchdog dismissals is the buckling case: the
+                    ' run is still 'successful' for extraction (partial data
+                    ' exists). Return True so the pipeline extracts; the CSV
+                    ' validator decides PASS vs PARTIAL from the step count.
+                    Return (runErr = 0 OrElse _watchdogDismissals > 0)
                 Catch ex As System.Exception
+                    StopDialogWatchdog()
                     Log("RunAnalysis failed: " & ex.Message)
                     Return False
                 End Try

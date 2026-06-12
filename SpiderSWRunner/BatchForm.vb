@@ -19,6 +19,7 @@ Public Class BatchForm
 
     Private Const SweepSlots As Integer = 5
 
+    Private _baseProvider As Func(Of BatchRow)
     Private _base As BatchRow
     Private _sw As SWAutomation
     Private _runner As BatchRunner
@@ -26,7 +27,10 @@ Public Class BatchForm
     Private _running As Boolean = False
 
     Private cbVar(SweepSlots - 1) As ComboBox
-    Private tbVals(SweepSlots - 1) As TextBox
+    Private tbFrom(SweepSlots - 1) As TextBox
+    Private tbTo(SweepSlots - 1) As TextBox
+    Private tbCount(SweepSlots - 1) As TextBox
+    Private tbList(SweepSlots - 1) As TextBox
     Private cbSweepMode As ComboBox
     Private chkBothDir As CheckBox
     Private chkPauseFirst As CheckBox
@@ -34,6 +38,7 @@ Public Class BatchForm
     Private tbMinPerRun As TextBox
     Private tbCheckpoint As TextBox
     Private btnGenerate As Button
+    Private btnDeleteRows As Button
     Private btnLoadCsv As Button
     Private btnSaveCsv As Button
     Private btnRun As Button
@@ -42,8 +47,9 @@ Public Class BatchForm
     Private lblSummary As Label
     Private txtLog As TextBox
 
-    Public Sub New(ByVal baseRow As BatchRow, ByVal sw As SWAutomation)
-        _base = baseRow
+    Public Sub New(ByVal baseProvider As Func(Of BatchRow), ByVal sw As SWAutomation)
+        _baseProvider = baseProvider
+        _base = baseProvider()
         _sw = sw
         _runner = New BatchRunner(_sw, AddressOf LogMsg)
         _runner.VerifyFirstRun = AddressOf VerifyFirstRunDialog
@@ -66,6 +72,22 @@ Public Class BatchForm
         Me.Controls.Add(lbl)
         y += 20
 
+        ' Column headers for the sweep matrix
+        Dim hdrFrom As Label = New Label()
+        hdrFrom.Text = "From" : hdrFrom.Location = New Point(134, y) : hdrFrom.AutoSize = True
+        Me.Controls.Add(hdrFrom)
+        Dim hdrTo As Label = New Label()
+        hdrTo.Text = "To" : hdrTo.Location = New Point(204, y) : hdrTo.AutoSize = True
+        Me.Controls.Add(hdrTo)
+        Dim hdrN As Label = New Label()
+        hdrN.Text = "# Values" : hdrN.Location = New Point(274, y) : hdrN.AutoSize = True
+        Me.Controls.Add(hdrN)
+        Dim hdrL As Label = New Label()
+        hdrL.Text = "or explicit list (overrides From/To): 0.25,0.30,0.38"
+        hdrL.Location = New Point(344, y) : hdrL.AutoSize = True : hdrL.ForeColor = Color.DimGray
+        Me.Controls.Add(hdrL)
+        y += 18
+
         For i As Integer = 0 To SweepSlots - 1
             cbVar(i) = New ComboBox()
             cbVar(i).Location = New Point(8, y)
@@ -78,19 +100,25 @@ Public Class BatchForm
             cbVar(i).SelectedIndex = 0
             Me.Controls.Add(cbVar(i))
 
-            tbVals(i) = New TextBox()
-            tbVals(i).Location = New Point(134, y)
-            tbVals(i).Size = New Size(330, 22)
-            Me.Controls.Add(tbVals(i))
+            tbFrom(i) = New TextBox()
+            tbFrom(i).Location = New Point(134, y)
+            tbFrom(i).Size = New Size(62, 22)
+            Me.Controls.Add(tbFrom(i))
 
-            If i = 0 Then
-                lbl = New Label()
-                lbl.Text = "values: 0.25,0.30,0.38  or range: 0.2:0.05:0.4"
-                lbl.Location = New Point(470, y + 3)
-                lbl.AutoSize = True
-                lbl.ForeColor = Color.DimGray
-                Me.Controls.Add(lbl)
-            End If
+            tbTo(i) = New TextBox()
+            tbTo(i).Location = New Point(204, y)
+            tbTo(i).Size = New Size(62, 22)
+            Me.Controls.Add(tbTo(i))
+
+            tbCount(i) = New TextBox()
+            tbCount(i).Location = New Point(274, y)
+            tbCount(i).Size = New Size(62, 22)
+            Me.Controls.Add(tbCount(i))
+
+            tbList(i) = New TextBox()
+            tbList(i).Location = New Point(344, y)
+            tbList(i).Size = New Size(300, 22)
+            Me.Controls.Add(tbList(i))
             y += 26
         Next
 
@@ -149,24 +177,26 @@ Public Class BatchForm
         Me.Controls.Add(tbCheckpoint)
         y += 30
 
-        btnGenerate = MakeBtn("Generate Matrix", 8, y, 130)
+        btnGenerate = MakeBtn("Generate Matrix", 8, y, 120)
         AddHandler btnGenerate.Click, AddressOf btnGenerate_Click
-        btnLoadCsv = MakeBtn("Load CSV...", 144, y, 95)
+        btnLoadCsv = MakeBtn("Load CSV...", 132, y, 90)
         AddHandler btnLoadCsv.Click, AddressOf btnLoadCsv_Click
-        btnSaveCsv = MakeBtn("Save CSV...", 245, y, 95)
+        btnSaveCsv = MakeBtn("Save CSV...", 226, y, 90)
         AddHandler btnSaveCsv.Click, AddressOf btnSaveCsv_Click
-        btnRun = MakeBtn("RUN BATCH", 360, y, 140)
+        btnDeleteRows = MakeBtn("Delete Selected Rows", 320, y, 140)
+        AddHandler btnDeleteRows.Click, AddressOf btnDeleteRows_Click
+        btnRun = MakeBtn("RUN BATCH", 468, y, 130)
         btnRun.BackColor = Color.FromArgb(200, 240, 200)
         btnRun.Enabled = False
         AddHandler btnRun.Click, AddressOf btnRun_Click
-        btnAbort = MakeBtn("ABORT", 506, y, 90)
+        btnAbort = MakeBtn("ABORT", 602, y, 80)
         btnAbort.BackColor = Color.FromArgb(250, 200, 200)
         btnAbort.Enabled = False
         AddHandler btnAbort.Click, AddressOf btnAbort_Click
 
         lblSummary = New Label()
         lblSummary.Text = "No matrix generated."
-        lblSummary.Location = New Point(610, y + 8)
+        lblSummary.Location = New Point(690, y + 8)
         lblSummary.AutoSize = True
         lblSummary.Font = New Font(Me.Font, FontStyle.Bold)
         Me.Controls.Add(lblSummary)
@@ -179,6 +209,8 @@ Public Class BatchForm
         grid.AllowUserToAddRows = False
         grid.AllowUserToDeleteRows = False
         grid.RowHeadersVisible = False
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        grid.MultiSelect = True
         grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells
         grid.Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
         Me.Controls.Add(grid)
@@ -218,14 +250,45 @@ Public Class BatchForm
     ' ── Generate matrix from sweep definition ──
     Private Sub btnGenerate_Click(ByVal sender As Object, ByVal e As EventArgs)
         Try
+            ' Re-read the base configuration from the main form so edits
+            ' made after this window opened are always honored.
+            _base = _baseProvider()
+            LogMsg(String.Format("Base re-read from main form: SLen={0} Angle={1} T={2} H_pp={3} OD={4} Dir={5} Out={6}", _
+                _base.StraightLength, _base.ConnectorAngle, _base.T, _base.H_pp, _base.OD, _base.Direction, _base.OutputDir))
             Dim vars As New List(Of SweepVar)()
             For i As Integer = 0 To SweepSlots - 1
-                If cbVar(i).SelectedIndex > 0 AndAlso tbVals(i).Text.Trim().Length > 0 Then
-                    Dim sv As New SweepVar()
-                    sv.Name = cbVar(i).SelectedItem.ToString()
-                    sv.Values = SweepVar.ParseValues(tbVals(i).Text)
-                    If sv.Values.Length > 0 Then vars.Add(sv)
+                If cbVar(i).SelectedIndex = 0 Then Continue For
+                Dim sv As New SweepVar()
+                sv.Name = cbVar(i).SelectedItem.ToString()
+
+                If tbList(i).Text.Trim().Length > 0 Then
+                    ' Explicit list wins (commas; start:step:stop also accepted)
+                    sv.Values = SweepVar.ParseValues(tbList(i).Text)
+                ElseIf tbFrom(i).Text.Trim().Length > 0 Then
+                    Dim vFrom As Double = Double.Parse(tbFrom(i).Text.Trim())
+                    Dim vTo As Double = vFrom
+                    If tbTo(i).Text.Trim().Length > 0 Then vTo = Double.Parse(tbTo(i).Text.Trim())
+                    Dim nVals As Integer = 1
+                    If tbCount(i).Text.Trim().Length > 0 Then nVals = Integer.Parse(tbCount(i).Text.Trim())
+                    If nVals < 1 Then nVals = 1
+                    Dim vals As New List(Of Double)()
+                    If nVals = 1 OrElse Math.Abs(vTo - vFrom) < 0.000000001 Then
+                        vals.Add(vFrom)
+                    Else
+                        ' nVals values inclusive of both endpoints
+                        Dim stepSz As Double = (vTo - vFrom) / CDbl(nVals - 1)
+                        For k As Integer = 0 To nVals - 1
+                            vals.Add(Math.Round(vFrom + stepSz * CDbl(k), 9))
+                        Next
+                    End If
+                    sv.Values = vals.ToArray()
+                    LogMsg(String.Format("  {0}: From {1} To {2}, {3} values -> {4}", _
+                        sv.Name, vFrom, vTo, nVals, _
+                        String.Join(", ", Array.ConvertAll(sv.Values, Function(d) d.ToString()))))
+                Else
+                    Continue For
                 End If
+                If sv.Values.Length > 0 Then vars.Add(sv)
             Next
             Dim mode As Integer = If(cbSweepMode.SelectedIndex = 1, _
                 SweepMatrix.ModeFullFactorial, SweepMatrix.ModeOneAtATime)
@@ -328,6 +391,50 @@ Public Class BatchForm
         LogMsg("Abort requested — batch will stop before the next row.")
     End Sub
 
+    Private Sub btnDeleteRows_Click(ByVal sender As Object, ByVal e As EventArgs)
+        ' Prune hand-picked rows from the run table (for coupled-tuple
+        ' campaigns: generate the nearest factorial, then delete the
+        ' combinations that are not wanted). RunIDs are kept stable for
+        ' traceability; the table re-prechecks after pruning.
+        If _running Then Return
+        If _rows Is Nothing OrElse grid.SelectedRows.Count = 0 Then
+            LogMsg("No rows selected.")
+            Return
+        End If
+        Dim doomed As New Dictionary(Of Integer, Boolean)()
+        For Each gr As DataGridViewRow In grid.SelectedRows
+            Dim rid As Integer
+            If Integer.TryParse(Convert.ToString(gr.Cells(0).Value), rid) Then
+                doomed(rid) = True
+            End If
+        Next
+        ' Refuse to delete rows that already ran — their files exist and the
+        ' table is the record of them.
+        Dim kept As New List(Of BatchRow)()
+        Dim removed As Integer = 0
+        Dim refused As Integer = 0
+        For Each r As BatchRow In _rows
+            If doomed.ContainsKey(r.RunID) Then
+                If r.Status = "PASS" OrElse r.Status = "PARTIAL" OrElse r.Status = "FAIL" Then
+                    refused += 1
+                    kept.Add(r)
+                Else
+                    removed += 1
+                End If
+            Else
+                kept.Add(r)
+            End If
+        Next
+        _rows = kept
+        LogMsg(String.Format("Deleted {0} row(s).{1}", removed, _
+            If(refused > 0, String.Format(" Refused {0} already-run row(s) — they are the record of completed work.", refused), "")))
+        Dim allOk As Boolean = False
+        If _rows.Count > 0 Then allOk = _runner.PrecheckAll(_rows)
+        FillGrid()
+        UpdateSummary()
+        btnRun.Enabled = allOk AndAlso _rows.Count > 0
+    End Sub
+
     Private Function VerifyFirstRunDialog(ByVal r As BatchRow) As Boolean
         Dim msg As String = String.Format( _
             "Run 1 complete ({0})." & vbCrLf & vbCrLf & _
@@ -350,7 +457,7 @@ Public Class BatchForm
         grid.Rows.Clear()
         For Each c As String In New String() { _
             "RunID", "Status", "Dir", "OD", "ID", "N", "H_pp", "T", "Lip", _
-            "Type", "Angle", "Mat", "E", "MaxDisp", "Steps", _
+            "Type", "Angle", "SLen", "Taper", "Pt%", "natH", "Mat", "E", "MaxDisp", "Steps", _
             "EffPitch", "MaxHpp", "Margin", "Precheck", "Note/Message"}
             grid.Columns.Add(c, c)
         Next
@@ -358,7 +465,9 @@ Public Class BatchForm
         For Each r As BatchRow In _rows
             Dim ri As Integer = grid.Rows.Add( _
                 r.RunID, r.Status, r.Direction, r.OD, r.ID, r.N, r.H_pp, r.T, r.LipWidth, _
-                BatchRunner.ProfileTag(r.ToProfile()), r.ConnectorAngle, r.MaterialName, r.E, _
+                BatchRunner.ProfileTag(r.ToProfile()), r.ConnectorAngle, r.StraightLength, _
+                r.TaperPct, r.PitchTaperPct, If(r.UseNaturalH, "Y", ""), _
+                r.MaterialName, r.E, _
                 r.MaxDisp, r.Steps, _
                 r.EffPitch.ToString("F3"), r.MaxHpp.ToString("F2"), r.Margin.ToString("F2"), _
                 If(r.PrecheckPass, "PASS", "FAIL"), _
@@ -367,6 +476,8 @@ Public Class BatchForm
                 grid.Rows(ri).DefaultCellStyle.BackColor = Color.FromArgb(255, 215, 215)
             ElseIf r.Status = "PASS" Then
                 grid.Rows(ri).DefaultCellStyle.BackColor = Color.FromArgb(215, 245, 215)
+            ElseIf r.Status = "PARTIAL" Then
+                grid.Rows(ri).DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 200)
             ElseIf r.Status = "FAIL" Then
                 grid.Rows(ri).DefaultCellStyle.BackColor = Color.FromArgb(255, 235, 200)
             End If
@@ -379,7 +490,7 @@ Public Class BatchForm
         For Each r As BatchRow In _rows
             If Not r.PrecheckPass Then badPre += 1
             Select Case r.Status
-                Case "PASS" : passed += 1
+                Case "PASS", "PARTIAL" : passed += 1
                 Case "FAIL", "SKIP" : failed += 1
                 Case Else : pend += 1
             End Select

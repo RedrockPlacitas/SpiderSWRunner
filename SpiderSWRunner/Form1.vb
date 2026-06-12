@@ -550,14 +550,14 @@ Imports Microsoft.VisualBasic
             End If
             MarkButton(btnMeshRun, True)
 
-            ' Step 5 — Extract
+            ' Step 5 — Extract (full automated extraction, same as button 5)
             Dim outDir As String = tbOutputDir.Text.Trim()
             If Not System.IO.Directory.Exists(outDir) Then
                 System.IO.Directory.CreateDirectory(outDir)
             End If
             Dim outPath As String = System.IO.Path.Combine(outDir, BuildOutputFilename(p))
             LogMessage("Output file: " & outPath)
-            MarkButton(btnExtract, _sw.ExtractResults(p, outPath))
+            MarkButton(btnExtract, _sw.ExtractResultsAuto(p, maxD, steps, outPath))
 
             Cursor = Cursors.Default
         End Sub
@@ -601,45 +601,51 @@ Imports Microsoft.VisualBasic
             Cursor = Cursors.Default
         End Sub
 
+        Private Function BuildBaseRow() As BatchRow
+            ' Reads the CURRENT main-form fields. Called by the Batch form on
+            ' every Generate Matrix click, so GUI edits made while the Batch
+            ' form is open are always picked up.
+            Dim p As SpiderProfile = BuildProfile()
+            Dim base As New BatchRow()
+            base.ComponentMode = p.ComponentMode
+            base.ID = p.ID
+            base.OD = p.OD
+            base.N = p.N
+            base.H_pp = p.H_pp
+            base.T = p.T
+            base.LipWidth = p.LipWidth
+            base.InnerLipWidth = p.InnerLipWidth
+            base.FirstRollUp = p.FirstRollUp
+            base.ProfileType = p.ProfileType
+            base.ConnectorAngle = p.ConnectorAngle
+            base.StraightLength = p.StraightLength
+            base.CenterFlat = p.CenterFlat
+            base.BulletR_Top = p.BulletR_Top
+            base.BulletCx = p.BulletCx
+            base.TaperPct = p.TaperPct
+            base.VariablePitch = p.VariablePitch
+            base.PitchTaperPct = p.PitchTaperPct
+            base.UseNaturalH = p.UseNaturalH
+            base.MaterialName = p.MaterialName
+            base.E = p.E
+            base.Nu = p.Nu
+            base.Density = p.Density
+            base.MaxDisp = D(tbMaxDisp, 10.0)
+            base.Steps = I(tbSteps, 20)
+            base.Direction = If(IsPullDirection(), "Pull", "Push")
+            base.OutputDir = tbOutputDir.Text.Trim()
+            Return base
+        End Function
+
         Private Sub btnBatch_Click(ByVal sender As Object, ByVal e As EventArgs) _
             Handles btnBatch.Click
             ' ─────────────────────────────────────────────────────────
-            ' Opens the Batch Sweep form. The CURRENT main-form fields
-            ' become the base configuration; swept variables override
-            ' them per generated row.
+            ' Opens the Batch Sweep form. The main-form fields are the
+            ' base configuration, RE-READ on every Generate Matrix click;
+            ' swept variables override them per generated row.
             ' ─────────────────────────────────────────────────────────
             Try
-                Dim p As SpiderProfile = BuildProfile()
-                Dim base As New BatchRow()
-                base.ComponentMode = p.ComponentMode
-                base.ID = p.ID
-                base.OD = p.OD
-                base.N = p.N
-                base.H_pp = p.H_pp
-                base.T = p.T
-                base.LipWidth = p.LipWidth
-                base.InnerLipWidth = p.InnerLipWidth
-                base.FirstRollUp = p.FirstRollUp
-                base.ProfileType = p.ProfileType
-                base.ConnectorAngle = p.ConnectorAngle
-                base.StraightLength = p.StraightLength
-                base.CenterFlat = p.CenterFlat
-                base.BulletR_Top = p.BulletR_Top
-                base.BulletCx = p.BulletCx
-                base.TaperPct = p.TaperPct
-                base.VariablePitch = p.VariablePitch
-                base.PitchTaperPct = p.PitchTaperPct
-                base.UseNaturalH = p.UseNaturalH
-                base.MaterialName = p.MaterialName
-                base.E = p.E
-                base.Nu = p.Nu
-                base.Density = p.Density
-                base.MaxDisp = D(tbMaxDisp, 10.0)
-                base.Steps = I(tbSteps, 20)
-                base.Direction = If(IsPullDirection(), "Pull", "Push")
-                base.OutputDir = tbOutputDir.Text.Trim()
-
-                Dim f As New BatchForm(base, _sw)
+                Dim f As New BatchForm(AddressOf BuildBaseRow, _sw)
                 f.Show(Me)
             Catch ex As System.Exception
                 LogMessage("ERROR opening Batch form: " & ex.Message)
