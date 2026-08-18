@@ -24,12 +24,32 @@ Imports SolidWorks.Interop.cosworks
         Private _idEdge As Edge = Nothing
         Private _odEdge As Edge = Nothing
 
+        ' Persist solid-mesh state for CreateFinestMesh (which takes no profile).
+        ' A thin-wall solid needs element size small vs the wall or it meshes zero.
+        Private _solidMesh As Boolean = False
+        Private _wallT As Double = 0.0
+        ' Set True inside CreateFinestMesh when a solid row's estimated element
+        ' count exceeds the ceiling (thin wall over a large ring). MeshAndRun
+        ' checks it and returns without running, so SW is never handed an
+        ' unmeshable thin solid to lock on.
+        Private _solidMeshSkip As Boolean = False
+        Private _solidElemCeiling As Double = 500000.0
+
         Public Sub New(ByVal logger As Action(Of String))
             _log = logger
         End Sub
 
         Private Sub Log(ByVal msg As String)
             If _log IsNot Nothing Then _log(msg)
+            ' Persist every line to disk. The textbox log is lost when SW locks
+            ' and the process is killed; this file survives a Ctrl-Alt-Del so the
+            ' exact last line before a lock (and every extraction step) is
+            ' recoverable. Wrapped so logging can never throw.
+            Try
+                System.IO.File.AppendAllText("C:\SpiderSW_Results\SpiderSW_debug.log", _
+                    DateTime.Now.ToString("HH:mm:ss.fff") & "  " & msg & System.Environment.NewLine)
+            Catch
+            End Try
         End Sub
 
         ' ──────────────────────────────────────────────────────────────
@@ -666,18 +686,39 @@ Imports SolidWorks.Interop.cosworks
                 _model.ClearSelection2(True)
                 _model.Extension.SelectByID2("Sketch1", "SKETCH", 0, 0, 0, False, 0, Nothing, 0)
 
-                Dim feat As Object = _model.FeatureManager.FeatureRevolve2( _
-                    True, False, False, False, False, False, _
-                    CInt(swEndConditions_e.swEndCondBlind), _
-                    CInt(swEndConditions_e.swEndCondBlind), _
-                    2.0 * Math.PI, 0, False, False, 0, 0, _
-                    CInt(swThinWallType_e.swThinWallOneDirection), _
-                    0, 0, True, True, True)
-
-                If feat Is Nothing Then
-                    Log("WARNING: FeatureRevolve2 returned Nothing")
+                Dim feat As Object
+                _solidMesh = profile.SolidMesh
+                _wallT = profile.T
+                If profile.SolidMesh Then
+                    ' Thin-wall SOLID of wall thickness T (SW revolve thickness is
+                    ' in METERS). Recovers valid stiffness where the shell degrades
+                    ' on the corrugation apex (high T/R_crest). IsSolid + IsThin true.
+                    Dim tMeters As Double = profile.T / 1000.0
+                    feat = _model.FeatureManager.FeatureRevolve2( _
+                        True, True, True, False, False, False, _
+                        CInt(swEndConditions_e.swEndCondBlind), _
+                        CInt(swEndConditions_e.swEndCondBlind), _
+                        2.0 * Math.PI, 0, False, False, 0, 0, _
+                        CInt(swThinWallType_e.swThinWallOneDirection), _
+                        tMeters, 0, True, True, True)
+                    If feat Is Nothing Then
+                        Log("WARNING: FeatureRevolve2 (thin-wall solid) returned Nothing")
+                    Else
+                        Log(String.Format("Thin-wall SOLID revolve created! wall={0:F3} mm", profile.T))
+                    End If
                 Else
-                    Log("Surface revolve created!")
+                    feat = _model.FeatureManager.FeatureRevolve2( _
+                        True, False, False, False, False, False, _
+                        CInt(swEndConditions_e.swEndCondBlind), _
+                        CInt(swEndConditions_e.swEndCondBlind), _
+                        2.0 * Math.PI, 0, False, False, 0, 0, _
+                        CInt(swThinWallType_e.swThinWallOneDirection), _
+                        0, 0, True, True, True)
+                    If feat Is Nothing Then
+                        Log("WARNING: FeatureRevolve2 returned Nothing")
+                    Else
+                        Log("Surface revolve created!")
+                    End If
                 End If
 
                 _model.ViewZoomtofit2()
@@ -723,8 +764,16 @@ Imports SolidWorks.Interop.cosworks
                 SetDimensionMM("Cone ID@Sketch2", profile.R_inner)
                 SetDimensionMM("Basket ID@Sketch2", profile.R_outer)
                 SetDimensionMM("Height@Sketch2", profile.H_pp)
-                SetDimensionMM("R2 Radius@Sketch2", profile.BulletCx)
-                SetDimensionMM("R2 Center@Sketch2", profile.BulletR_Top)
+                ' FIX (2026-06-14): R2 Radius and R2 Center were swapped, which
+                ' fed the crown-radius dim a center-offset value (and vice versa),
+                ' producing a zero-length line — the sketch failed to update and
+                ' the part meshed at the template's stale default geometry.
+                '   R2 Radius@Sketch2 = crown arc radius           = BulletR_Top
+                '   R2 Center@Sketch2 = absolute crown center pos  = R_inner + Cx
+                ' (template frame: R2 Center is in the same axis frame as Cone ID,
+                '  e.g. default Cone ID 50 / R2 Center 55 = centered on a 10 span.)
+                SetDimensionMM("R2 Radius@Sketch2", profile.BulletR_Top)
+                SetDimensionMM("R2 Center@Sketch2", profile.R_inner + profile.GetBulletCx())
                 SetDimensionMM("InnerLip@Sketch2", profile.InnerLipWidth)
                 SetDimensionMM("OuterLip@Sketch2", profile.LipWidth)
 
@@ -1061,14 +1110,50 @@ Imports SolidWorks.Interop.cosworks
                 Log("Shell thickness + material...")
                 Dim shellOK As Boolean = False
                 Dim shellMatOK As Boolean = False
+                If profile.SolidMesh Then
+                    ' Solid body: wall thickness is geometric, material applied via
+                    ' the SolidManager path in 3.2. No shell definition to set.
+                    Log("  SOLID mode: wall is geometric; shell thickness skipped, material from solid path")
+                    shellOK = True
+                    shellMatOK = True
+                Else
                 Try
                     Dim shellMgr As CWShellManager = _study.ShellManager
                     If shellMgr IsNot Nothing AndAlso shellMgr.ShellCount > 0 Then
-                        Dim shErr As Integer = 0
-                        Dim sh As CWShell = shellMgr.GetShellAt(0, shErr)
-                        If sh IsNot Nothing Then
-                            ' --- Thickness (BeginEdit/EndEdit IS the OK button) ---
+                        Dim nShells As Integer = shellMgr.ShellCount
+                        Log(String.Format("  ShellManager reports {0} shell(s) — applying thickness/material to all", nShells))
+                        shellOK = True
+                        shellMatOK = True
+                        For si As Integer = 0 To nShells - 1
+                            Dim shErr As Integer = 0
+                            Dim sh As CWShell = shellMgr.GetShellAt(si, shErr)
+                            If sh Is Nothing Then
+                                Log(String.Format("  Shell {0}: GetShellAt returned Nothing", si))
+                                shellOK = False
+                                Continue For
+                            End If
+                            ' --- ONE edit bracket for material + thickness. ShellEndEdit IS
+                            '     the dialog's OK button: changes made outside the bracket are
+                            '     visible to read-backs but NEVER COMMITTED to the solve. That is
+                            '     why ModelType read back 5 while the study solved linear (2 GPa).
+                            '     The manual fix worked because clicking OK commits; the code was
+                            '     changing the material outside the bracket and losing it. ---
                             sh.ShellBeginEdit()
+                            Dim matThis As Boolean = ApplyShellLibraryMaterial(sh, profile)
+                            If Not matThis Then
+                                ' The custom fallback builds a LINEAR material. For _MR
+                                ' (hyperelastic) cards it must NEVER run — it silently
+                                ' replaces the Mooney card with linear (root cause of the
+                                ' 12:18-13:20 linear solves in the debug log).
+                                If profile.MaterialName.EndsWith("_MR", StringComparison.OrdinalIgnoreCase) Then
+                                    Log("  *** _MR library assignment FAILED — linear fallback SKIPPED (would overwrite hyperelastic card) ***")
+                                Else
+                                    matThis = ApplyCustomShellMaterial(sh, profile)
+                                End If
+                            End If
+                            If Not matThis Then shellMatOK = False
+
+                            ' --- Thickness (same bracket, committed together) ---
                             Try
                                 sh.ShellUnit = CInt(swsLinearUnit_e.swsLinearUnitMillimeters)
                             Catch
@@ -1076,7 +1161,7 @@ Imports SolidWorks.Interop.cosworks
                             Try
                                 sh.ShellThickness = CDbl(profile.T)
                             Catch ex2 As System.Exception
-                                Log("  ShellThickness set failed: " & ex2.Message)
+                                Log("  Shell " & si & " ShellThickness set failed: " & ex2.Message)
                             End Try
                             Dim endRet As Object = Nothing
                             Try
@@ -1088,29 +1173,20 @@ Imports SolidWorks.Interop.cosworks
                             ' Read-back verification
                             Try
                                 Dim tBack As Double = CDbl(sh.ShellThickness)
-                                Log(String.Format("  Shell thickness applied: {0:F3} mm (read-back {1:F3}, EndEdit={2})", _
-                                    profile.T, tBack, If(endRet Is Nothing, "?", endRet.ToString())))
-                                shellOK = (Math.Abs(tBack - profile.T) < 0.001)
+                                Log(String.Format("  Shell {0} thickness applied: {1:F3} mm (read-back {2:F3}, EndEdit={3})", _
+                                    si, profile.T, tBack, If(endRet Is Nothing, "?", endRet.ToString())))
+                                If Math.Abs(tBack - profile.T) >= 0.001 Then shellOK = False
                             Catch
-                                Log(String.Format("  Shell thickness set to {0:F3} mm (read-back unavailable)", profile.T))
-                                shellOK = True
+                                Log(String.Format("  Shell {0} thickness set to {1:F3} mm (read-back unavailable)", si, profile.T))
                             End Try
-
-                            ' --- Shell material: library DB by FULL PATH (primary),
-                            '     verified by reading back Nu and the G/E ratio ---
-                            shellMatOK = ApplyShellLibraryMaterial(sh, profile)
-
-                            ' --- Fallback: custom in-code material with explicit E/Nu/G/Density ---
-                            If Not shellMatOK Then
-                                shellMatOK = ApplyCustomShellMaterial(sh, profile)
-                            End If
-                        End If
+                        Next
                     Else
                         Log("  No shells found in ShellManager")
                     End If
                 Catch ex As System.Exception
                     Log("  Shell setup failed: " & ex.Message)
                 End Try
+                End If
                 If Not shellOK Then
                     Log(String.Format("  *** MANUAL: Right-click Part -> Edit Definition -> accept {0}mm ***", profile.T))
                 End If
@@ -1199,8 +1275,15 @@ Imports SolidWorks.Interop.cosworks
                                     ' Safety: if only one flat face found, don't use same face for both
                                     If innerFace IsNot Nothing AndAlso lipFace IsNot Nothing AndAlso _
                                        Object.ReferenceEquals(innerFace, lipFace) Then
+                                        ' Flat single-face ring (Type 13): inner flange and outer lip
+                                        ' resolve to the SAME planar disk face. Fixing that whole face
+                                        ' clamps the entire plate, then prescribing the ID edge fights it
+                                        ' (over-constrained -> solver throws limit-point dialogs, no results).
+                                        ' Null BOTH faces so the BCs route to edges: OD edge fixed,
+                                        ' ID edge displaced — the correct clamped-outer / pushed-inner plate.
                                         innerFace = Nothing
-                                        Log("  WARNING: only one flat face found, ID face = OD face — using ID edge fallback")
+                                        lipFace = Nothing
+                                        Log("  Flat single-face ring: OD edge (fixed) + ID edge (displaced), not whole-disk face")
                                     End If
                                 End If
                             End If
@@ -1388,23 +1471,48 @@ Imports SolidWorks.Interop.cosworks
                             Log("  FixedTimeIncrement failed: " & ex2.Message)
                         End Try
 
-                        ' Stepping-method selector. TimeIncrement is Int32; the public
-                        ' docs do not state which integer means Fixed vs Automatic.
-                        ' EMPIRICAL APPROACH: a fresh study defaults to Automatic, so we
-                        ' read the default, set the flipped binary value (= Fixed), and
-                        ' read back. The batch validator independently verifies fixed
-                        ' stepping by requiring CSV data-row count == requested steps.
+                        ' Stepping-method selector (Int32). Earlier code flipped
+                        ' to the OPPOSITE of the study default, assuming default =
+                        ' Automatic. That is unreliable: if the study already
+                        ' defaulted to the Fixed value, flipping set it to
+                        ' Automatic, and the solver ran adaptive (symptom: CSV
+                        ' row count << requested steps, non-uniform increments).
+                        ' DETERMINISTIC FIX (2026-06-14): try BOTH candidate
+                        ' values explicitly and keep the one whose read-back
+                        ' sticks to a Fixed setting. We treat the value that
+                        ' coexists with our FixedTimeIncrement as Fixed. We set
+                        ' the value, re-assert FixedTimeIncrement, and log both.
+                        ' On SW2014 the Fixed selector is conventionally 1, so we
+                        ' try 1 first, then 0 as fallback.
                         Try
                             Dim tiBefore As Integer = opts.TimeIncrement
-                            Dim tiTarget As Integer = If(tiBefore = 0, 1, 0)
-                            opts.TimeIncrement = tiTarget
-                            Dim tiAfter As Integer = opts.TimeIncrement
-                            Log(String.Format("  TimeIncrement selector: default={0} -> set {1} -> read-back {2}", _
-                                tiBefore, tiTarget, tiAfter))
-                            If tiAfter = tiBefore Then
-                                Log("  WARNING: TimeIncrement did not change — verify 'Fixed' in Study Properties on run 1")
+                            Dim applied As Integer = -1
+                            For Each candidate As Integer In New Integer() {1, 0}
+                                opts.TimeIncrement = candidate
+                                ' Re-assert fixed step size after switching mode
+                                Try : opts.FixedTimeIncrement = stepSize : Catch : End Try
+                                Dim rb As Integer = opts.TimeIncrement
+                                Log(String.Format("  TimeIncrement try {0} -> read-back {1}", candidate, rb))
+                                If rb = candidate Then
+                                    applied = candidate
+                                    ' candidate 1 is the conventional Fixed value;
+                                    ' accept it and stop. If only 0 sticks, accept
+                                    ' that (some builds invert), but keep going to
+                                    ' prefer 1 when both stick.
+                                    If candidate = 1 Then Exit For
+                                End If
+                            Next
+                            ' Ensure we end on the Fixed-intended value (prefer 1)
+                            opts.TimeIncrement = 1
+                            Try : opts.FixedTimeIncrement = stepSize : Catch : End Try
+                            Dim finalRb As Integer = opts.TimeIncrement
+                            Log(String.Format("  TimeIncrement FINAL = {0} (was default {1}); FixedTimeIncrement = {2:F6} ({3} steps)", _
+                                finalRb, tiBefore, stepSize, nSteps))
+                            If finalRb <> 1 Then
+                                Log("  WARNING: could not confirm Fixed(=1); validator will flag if stepping is not fixed.")
+                                Log("  *** If run 1 shows non-uniform steps: Study Properties -> Stepping -> Fixed -> OK ***")
                             Else
-                                Log("  Stepping flipped from study default (Automatic) -> FIXED")
+                                Log("  Stepping = FIXED confirmed")
                             End If
                         Catch ex2 As System.Exception
                             Log("  TimeIncrement failed: " & ex2.Message)
@@ -1488,6 +1596,46 @@ Imports SolidWorks.Interop.cosworks
                     If ok Then
                         Log(String.Format("  {0} SetLibraryMaterial OK: '{1}' from", label, profile.MaterialName))
                         Log("    " & dbPath)
+                        ' HYPERELASTIC (_MR) cards: this object (SolidComponent/SolidBody) is
+                        ' what the STUDY TREE material node maps to — the object the manual
+                        ' "choose Mooney" click edits. SetLibraryMaterial loads the card but
+                        ' SW defaults the model to Linear Elastic (E=2e9 stand-in). Select the
+                        ' Mooney model HERE, on the study-tree object, via late binding
+                        ' (these types are not in the reflected dump). Try the getter names,
+                        ' set ModelType=5 + 2 constants, write back if a setter exists.
+                        If profile.MaterialName.EndsWith("_MR", StringComparison.OrdinalIgnoreCase) Then
+                            Dim matObj As Object = Nothing
+                            For Each getter As String In New String() {"GetSolidMaterial", "GetMaterial", "GetDefaultMaterial"}
+                                Try
+                                    matObj = CallByName(target, getter, CallType.Method)
+                                    If matObj IsNot Nothing Then
+                                        Log(String.Format("    {0}.{1}: material object obtained", label, getter))
+                                        Exit For
+                                    End If
+                                Catch : End Try
+                            Next
+                            If matObj IsNot Nothing Then
+                                Dim mtBack As Integer = -1
+                                Try
+                                    CallByName(matObj, "ModelType", CallType.Set, 7)   ' 7=Mooney-Rivlin (probe-verified 2026-07-08)
+                                    Try : CallByName(matObj, "MooneyRivlinConstants", CallType.Set, 2) : Catch : End Try
+                                    Try : mtBack = CInt(CallByName(matObj, "ModelType", CallType.Get)) : Catch : End Try
+                                    ' write back if a setter exists on this object
+                                    For Each setter As String In New String() {"SetSolidMaterial", "SetMaterial"}
+                                        Try
+                                            CallByName(target, setter, CallType.Method, matObj)
+                                            Log(String.Format("    {0}.{1}: material written back", label, setter))
+                                            Exit For
+                                        Catch : End Try
+                                    Next
+                                    Log(String.Format("    {0} HYPERELASTIC: ModelType set=5 read-back={1}", label, mtBack))
+                                Catch exM As System.Exception
+                                    Log(String.Format("    {0} HYPERELASTIC ModelType failed: {1}", label, exM.Message))
+                                End Try
+                            Else
+                                Log(String.Format("    {0}: no material getter found (tried GetSolidMaterial/GetMaterial/GetDefaultMaterial)", label))
+                            End If
+                        End If
                         Return True
                     End If
                 Catch
@@ -1504,14 +1652,69 @@ Imports SolidWorks.Interop.cosworks
         ' ──────────────────────────────────────────────────────────────
         Private Function ApplyShellLibraryMaterial(ByVal sh As CWShell, _
                                                    ByVal profile As SpiderProfile) As Boolean
+            ' Hyperelastic cards (name ends "_MR") need the model TYPE selected after
+            ' the library material is loaded — SetLibraryMaterial loads the card but SW
+            ' defaults the model to Linear Elastic (the 2 GPa fallback seen in the log).
+            ' This is the code equivalent of choosing "Hyperelastic - Mooney Rivlin" in
+            ' the study material dialog. Verified API (SimAPI dump): CWShell.GetShellMaterial
+            ' -> CWMaterial.ModelType (set) / .MooneyRivlinConstants. C10/C01/Nu/Density
+            ' come from the card; nothing is entered here.
+            Dim isHyper As Boolean = profile.MaterialName.EndsWith("_MR", StringComparison.OrdinalIgnoreCase)
             For Each dbPath As String In ResolveMaterialDbPaths()
                 Try
                     Dim ret As Integer = sh.SetLibraryMaterial(dbPath, profile.MaterialName)
-                    If VerifyShellMaterial(sh, profile) Then
-                        Log(String.Format("  Shell SetLibraryMaterial '{0}' VERIFIED (ret={1}) from", _
-                            profile.MaterialName, ret))
-                        Log("    " & dbPath)
-                        Return True
+                    If isHyper Then
+                        Try
+                            Dim mat As CWMaterial = sh.GetShellMaterial()
+                            If mat IsNot Nothing Then
+                                LogMooneyProps("    card state after SetLibraryMaterial", mat)
+                                ' ModelType=7 = Hyperelastic Mooney-Rivlin. VERIFIED by probe
+                                ' (2026-07-08): manual dialog selection of Mooney on this study
+                                ' read back ModelType=7, MooneyRivlinConstants=2. The 5 used
+                                ' previously was wrong (unverified guess) — root cause of the
+                                ' linear solves and the 19:07 solver hang.
+                                mat.ModelType = 7
+                                Try : mat.MooneyRivlinConstants = 2 : Catch : End Try  ' 2-constant (C10+C01)
+                                ' CRITICAL: GetShellMaterial returns a detached copy. Mutating it
+                                ' does NOT change what the shell solves with — the change only
+                                ' reaches the solve if written back via SetShellMaterial. Without
+                                ' this the tree shows the right NAME but solves LINEAR (the 2 GPa /
+                                ' 1333 MPa result), even though ModelType read-back on the copy = 5.
+                                Dim setRet As Integer = -999
+                                Try
+                                    setRet = sh.SetShellMaterial(DirectCast(mat, Object))
+                                Catch exSet As System.Exception
+                                    Log("    SetShellMaterial threw: " & exSet.Message)
+                                End Try
+                                ' Verify against the shell's ACTUAL material after write-back
+                                Dim mtBack As Integer = -1
+                                Dim nmrBack As Integer = -1
+                                Try
+                                    Dim matChk As CWMaterial = sh.GetShellMaterial()
+                                    mtBack = matChk.ModelType
+                                    Try : nmrBack = matChk.MooneyRivlinConstants : Catch : End Try
+                                    LogMooneyProps("    committed material", matChk)
+                                Catch : End Try
+                                Log(String.Format("  Shell HYPERELASTIC '{0}': SetShellMaterial ret={1}, shell ModelType now={2} (7=Mooney-Rivlin, probe-verified), constants={3}", _
+                                    profile.MaterialName, setRet, mtBack, nmrBack))
+                                ' Strict gate: the manual known-good state reads ModelType=7
+                                ' AND MooneyRivlinConstants=2. Anything else is not the good
+                                ' state — fail loudly rather than solve wrong physics.
+                                If mtBack = 7 AndAlso nmrBack = 2 Then
+                                    Log("    from " & dbPath)
+                                    Return True
+                                End If
+                            End If
+                        Catch exH As System.Exception
+                            Log("    hyperelastic ModelType set failed: " & exH.Message)
+                        End Try
+                    Else
+                        If VerifyShellMaterial(sh, profile) Then
+                            Log(String.Format("  Shell SetLibraryMaterial '{0}' VERIFIED (ret={1}) from", _
+                                profile.MaterialName, ret))
+                            Log("    " & dbPath)
+                            Return True
+                        End If
                     End If
                 Catch
                 End Try
@@ -1549,6 +1752,16 @@ Imports SolidWorks.Interop.cosworks
                     Log(String.Format("    Nu mismatch: read {0:F4} vs profile {1:F4}", nuV, profile.Nu))
                     Return False
                 End If
+                ' ABSOLUTE E check (2026-08-18): Nu and G/E ratio alone cannot catch a
+                ' card whose E differs from the row (both scale together). Compare EX
+                ' against the row's E (MPa -> Pa) within 1%.
+                If exV > 0.0 Then
+                    Dim expE_Pa As Double = profile.E * 1000000.0
+                    If Math.Abs(exV - expE_Pa) / expE_Pa > 0.01 Then
+                        Log(String.Format("    E mismatch: read {0:G6} Pa vs row {1:G6} Pa", exV, expE_Pa))
+                        Return False
+                    End If
+                End If
                 If exV > 0.0 AndAlso gxV > 0.0 Then
                     Dim ratio As Double = gxV / exV
                     Dim expected As Double = 1.0 / (2.0 * (1.0 + nuV))
@@ -1569,6 +1782,102 @@ Imports SolidWorks.Interop.cosworks
                 Return False
             End Try
         End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' Helper — log the Mooney/linear property state of a material
+        ' object via GetPropertyByName. Property names MOONEY_A/MOONEY_B
+        ' verified verbatim from Custom Materials.sldmat (the _MR card's
+        ' XML property elements). NaN = property not readable.
+        ' ──────────────────────────────────────────────────────────────
+        Private Sub LogMooneyProps(ByVal prefix As String, ByVal mat As CWMaterial)
+            If mat Is Nothing Then Return
+            Try
+                Dim tdep As Integer = 0
+                Dim aV As Double, bV As Double, exV As Double, nuV As Double
+                Try : aV = mat.GetPropertyByName(0, "MOONEY_A", tdep) : Catch : aV = Double.NaN : End Try
+                Try : bV = mat.GetPropertyByName(0, "MOONEY_B", tdep) : Catch : bV = Double.NaN : End Try
+                Try : exV = mat.GetPropertyByName(0, "EX", tdep) : Catch : exV = Double.NaN : End Try
+                Try : nuV = mat.GetPropertyByName(0, "NUXY", tdep) : Catch : nuV = Double.NaN : End Try
+                Log(String.Format("{0}: MOONEY_A={1:G6}  MOONEY_B={2:G6}  EX={3:G6}  NUXY={4:F4}", _
+                    prefix, aV, bV, exV, nuV))
+            Catch : End Try
+        End Sub
+
+        ' ──────────────────────────────────────────────────────────────
+        ' DIAGNOSTIC — Probe the ACTIVE study's shell material state.
+        ' Read-only; changes nothing. Intended use: run Setup, manually
+        ' select Hyperelastic - Mooney Rivlin in the study material
+        ' dialog (the known-good manual state), click Probe. The output
+        ' gives ground truth for:
+        '   (a) the real ModelType enum value for Mooney-Rivlin
+        '       (the 5 used in ApplyShellLibraryMaterial is UNVERIFIED)
+        '   (b) whether MOONEY_A/MOONEY_B and MooneyRivlinConstants are
+        '       visible on the CWShell material object at all when the
+        '       manual selection is in effect. If the good state shows
+        '       nothing different here, CWShell is the wrong target.
+        ' ──────────────────────────────────────────────────────────────
+        Public Sub ProbeShellMaterial()
+            Try
+                If Not ReconnectStudy() Then Return
+                Log("========================================")
+                Log("  SHELL MATERIAL STATE PROBE (read-only)")
+                Log("========================================")
+                Try : Log("  Study: '" & _study.Name & "'") : Catch : End Try
+                Dim shellMgr As CWShellManager = _study.ShellManager
+                If shellMgr Is Nothing OrElse shellMgr.ShellCount < 1 Then
+                    Log("  No shells in ShellManager — nothing to probe")
+                    Return
+                End If
+                For si As Integer = 0 To shellMgr.ShellCount - 1
+                    Dim shErr As Integer = 0
+                    Dim sh As CWShell = shellMgr.GetShellAt(si, shErr)
+                    If sh Is Nothing Then
+                        Log(String.Format("  Shell {0}: GetShellAt returned Nothing (err={1})", si, shErr))
+                        Continue For
+                    End If
+                    Dim mat As CWMaterial = Nothing
+                    Try
+                        mat = sh.GetShellMaterial()
+                    Catch ex As System.Exception
+                        Log(String.Format("  Shell {0}: GetShellMaterial threw: {1}", si, ex.Message))
+                    End Try
+                    If mat Is Nothing Then
+                        Log(String.Format("  Shell {0}: GetShellMaterial returned Nothing", si))
+                        Continue For
+                    End If
+                    Log(String.Format("  Shell {0}:", si))
+                    Try
+                        Log("    MaterialName          = '" & mat.MaterialName & "'")
+                    Catch ex As System.Exception
+                        Log("    MaterialName          read failed: " & ex.Message)
+                    End Try
+                    Try
+                        Log("    ModelType             = " & mat.ModelType.ToString())
+                    Catch ex As System.Exception
+                        Log("    ModelType             read failed: " & ex.Message)
+                    End Try
+                    Try
+                        Log("    MooneyRivlinConstants = " & mat.MooneyRivlinConstants.ToString())
+                    Catch ex As System.Exception
+                        Log("    MooneyRivlinConstants read failed: " & ex.Message)
+                    End Try
+                    For Each pname As String In New String() {"MOONEY_A", "MOONEY_B", "EX", "NUXY", "GXY", "DENS"}
+                        Try
+                            Dim tdep As Integer = 0
+                            Dim v As Double = mat.GetPropertyByName(0, pname, tdep)
+                            Log(String.Format("    {0,-9} = {1:G6}", pname, v))
+                        Catch ex As System.Exception
+                            Log(String.Format("    {0,-9} read failed: {1}", pname, ex.Message))
+                        End Try
+                    Next
+                Next
+                Log("========================================")
+                Log("  MATERIAL PROBE COMPLETE")
+                Log("========================================")
+            Catch ex As System.Exception
+                Log("MATERIAL PROBE ERROR: " & ex.Message)
+            End Try
+        End Sub
 
         ' ──────────────────────────────────────────────────────────────
         ' Fallback — custom in-code shell material with EXPLICIT E/Nu/G/Density.
@@ -1644,6 +1953,8 @@ Imports SolidWorks.Interop.cosworks
         ' global element size. Falls back to RunAnalysis auto-mesh on failure.
         ' ──────────────────────────────────────────────────────────────
         Public Function CreateFinestMesh() As Boolean
+            _solidMeshSkip = False
+            Log("  CreateFinestMesh: entered")
             If Not ReconnectStudy() Then Return False
             Try
                 Dim mesh As CWMesh = _study.Mesh
@@ -1668,22 +1979,43 @@ Imports SolidWorks.Interop.cosworks
                 End Try
 
                 Dim unit As Integer = CInt(swsLinearUnit_e.swsLinearUnitMillimeters)
-                Dim elSize As Double = 0.0
-                Dim tol As Double = 0.0
-                Try
-                    mesh.GetDefaultElementSizeAndTolerance(unit, elSize, tol)
-                    Log(String.Format("  Default mesh: el={0:F4}mm tol={1:F5}mm", elSize, tol))
-                Catch ex As System.Exception
-                    Log("  GetDefaultElementSizeAndTolerance failed: " & ex.Message)
-                    Return False
-                End Try
-                If elSize <= 0.0 Then
-                    Log("  Default element size non-positive — auto-mesh fallback")
+                Dim fineEl As Double = 0.0
+                Dim fineTol As Double = 0.0
+
+                If _solidMesh AndAlso _wallT > 0.0 Then
+                    ' VERIFIED (SpiderSW_debug.log, RunID 27/28, T=1.2): _study.CreateMesh
+                    ' HANGS at el=wall for this thin corrugated solid — at the THICKEST
+                    ' wall in the batch, so it is not a thickness problem. One quadratic
+                    ' element through a thin wall fails the mesher's element checks;
+                    ' el=wall/2 (two elements through the wall) re-triggers the in-plane
+                    ' tet explosion over the OD ring. Draft/linear meshes but is too
+                    ' stiff for Kms0 (ruled out). There is no solid mesh for this
+                    ' geometry in SW Simulation's mesher. Skip ALL solid rows so the
+                    ' batch never locks SW; high-T/R stiffness recovery moves to SD
+                    ' (analytical), not solid FEA.
+                    _solidMeshSkip = True
+                    Log(String.Format("  SOLID: wall={0:F3}mm — SW mesher hangs on this thin solid at any T; skipping row (recovery moves to SD analytical).", _wallT))
                     Return False
                 End If
+                If Not _solidMesh Then
+                    ' ── SHELL path (unchanged; solids skipped and returned above) ─
+                    Dim elSize As Double = 0.0
+                    Dim tol As Double = 0.0
+                    Try
+                        mesh.GetDefaultElementSizeAndTolerance(unit, elSize, tol)
+                        Log(String.Format("  Default mesh: el={0:F4}mm tol={1:F5}mm", elSize, tol))
+                    Catch ex As System.Exception
+                        Log("  GetDefaultElementSizeAndTolerance failed: " & ex.Message)
+                        Return False
+                    End Try
+                    If elSize <= 0.0 Then
+                        Log("  Default element size non-positive — auto-mesh fallback")
+                        Return False
+                    End If
+                    fineEl = elSize * 0.5
+                    fineTol = tol * 0.5
+                End If
 
-                Dim fineEl As Double = elSize * 0.5
-                Dim fineTol As Double = tol * 0.5
                 Log(String.Format("  Creating FINEST mesh: el={0:F4}mm tol={1:F5}mm ...", fineEl, fineTol))
                 Try
                     Dim meshErr As Integer = _study.CreateMesh(unit, fineEl, fineTol)
@@ -1803,6 +2135,7 @@ Imports SolidWorks.Interop.cosworks
         End Function
 
         Public Sub ShutdownSolidWorks()
+            ' Release COM references first.
             Try
                 _study = Nothing : _cwDoc = Nothing : _cw = Nothing
                 _idEdge = Nothing : _odEdge = Nothing
@@ -1821,27 +2154,84 @@ Imports SolidWorks.Interop.cosworks
                 GC.Collect()
                 GC.WaitForPendingFinalizers()
             Catch : End Try
-            ' Hard-kill any remaining SLDWORKS process after a grace period
-            System.Threading.Thread.Sleep(5000)
+
+            ' ExitApp can raise a modal "save changes?" / rebuild dialog that
+            ' hangs the process forever — and the per-run watchdog is not
+            ' covering this window. Run a short local dismiss loop while we
+            ' wait for graceful exit, THEN hard-kill anything still alive.
+            ' Verified failure mode 2026-06-12: restart died at the run-12
+            ' boundary because a wedged SLDWORKS held the COM/journal lock.
+            Dim deadline As DateTime = DateTime.Now.AddSeconds(15)
+            While DateTime.Now < deadline
+                Try
+                    EnumWindows(AddressOf WatchdogEnum, IntPtr.Zero)
+                Catch
+                End Try
+                If System.Diagnostics.Process.GetProcessesByName("SLDWORKS").Length = 0 Then Exit While
+                Thread.Sleep(500)
+            End While
+
+            ' Decisive kill — do not wait politely, the process already had its
+            ' chance to exit gracefully above.
+            KillAllSolidWorks()
+            Log("SolidWorks shut down.")
+        End Sub
+
+        ' Kill every SLDWORKS process and confirm they are gone. Returns True
+        ' when the process table is clear.
+        Public Function KillAllSolidWorks() As Boolean
             Try
                 For Each pr As System.Diagnostics.Process In _
                     System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
                     Try
-                        If Not pr.WaitForExit(20000) Then
-                            Log("  Killing SLDWORKS pid " & pr.Id)
-                            pr.Kill()
-                        End If
+                        Log("  Killing SLDWORKS pid " & pr.Id)
+                        pr.Kill()
                     Catch : End Try
                 Next
             Catch : End Try
-            Log("SolidWorks shut down.")
-        End Sub
+            ' Verify clear — wait up to 15s for the OS to reap them.
+            Dim deadline As DateTime = DateTime.Now.AddSeconds(15)
+            While DateTime.Now < deadline
+                If System.Diagnostics.Process.GetProcessesByName("SLDWORKS").Length = 0 Then
+                    Return True
+                End If
+                Thread.Sleep(500)
+            End While
+            Dim remaining As Integer = System.Diagnostics.Process.GetProcessesByName("SLDWORKS").Length
+            If remaining > 0 Then
+                Log(String.Format("  WARNING: {0} SLDWORKS process(es) still present after kill", remaining))
+            End If
+            Return (remaining = 0)
+        End Function
 
         Public Function RestartSolidWorks() As Boolean
             Log("── Restarting SolidWorks (memory hygiene) ──")
             ShutdownSolidWorks()
-            System.Threading.Thread.Sleep(3000)
-            Return ConnectOrStart()
+
+            ' Guarantee a clean process table before relaunching — a lingering
+            ' wedged instance holds the COM registration and journal lock and
+            ' is the documented cause of relaunch failure.
+            If Not KillAllSolidWorks() Then
+                Log("  Clean-slate not reached; waiting longer...")
+                Thread.Sleep(10000)
+                KillAllSolidWorks()
+            End If
+            Thread.Sleep(5000)
+
+            ' Relaunch with up to 3 attempts — cold starts occasionally fail
+            ' to register COM on the first try.
+            For attempt As Integer = 1 To 3
+                Log(String.Format("  Relaunch attempt {0}/3...", attempt))
+                If ConnectOrStart() Then
+                    Log("  SolidWorks restarted OK.")
+                    Return True
+                End If
+                Log("  Attempt failed; clearing and retrying...")
+                KillAllSolidWorks()
+                Thread.Sleep(8000)
+            Next
+            Log("  ERROR: SolidWorks restart failed after 3 attempts.")
+            Return False
         End Function
 
         ' ──────────────────────────────────────────────────────────────
@@ -1902,37 +2292,64 @@ Imports SolidWorks.Interop.cosworks
         Private Declare Auto Function PostMessage Lib "user32.dll" ( _
             ByVal hWnd As IntPtr, ByVal msg As Integer, _
             ByVal wParam As IntPtr, ByVal lParam As IntPtr) As Boolean
+        Private Declare Auto Function SendMessage Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr, ByVal msg As Integer, _
+            ByVal wParam As IntPtr, ByVal lParam As IntPtr) As IntPtr
+        Private Declare Auto Function FindWindowEx Lib "user32.dll" ( _
+            ByVal parent As IntPtr, ByVal childAfter As IntPtr, _
+            ByVal cls As String, ByVal title As String) As IntPtr
+        Private Declare Auto Function SetForegroundWindow Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr) As Boolean
+        Private Declare Auto Function EnumChildWindows Lib "user32.dll" ( _
+            ByVal parent As IntPtr, ByVal cb As EnumWindowsProc, ByVal l As IntPtr) As Boolean
+        Private Declare Auto Function GetWindow Lib "user32.dll" ( _
+            ByVal hWnd As IntPtr, ByVal cmd As Integer) As IntPtr
+        Private Declare Auto Function GetDesktopWindow Lib "user32.dll" () As IntPtr
+        Private Declare Auto Function GetWindowText Lib "user32.dll" Alias "GetWindowTextW" ( _
+            ByVal hWnd As IntPtr, ByVal sb As System.Text.StringBuilder, ByVal max As Integer) As Integer
         Private Delegate Function EnumWindowsProc(ByVal hWnd As IntPtr, ByVal l As IntPtr) As Boolean
 
         Private Const WM_KEYDOWN As Integer = &H100
         Private Const WM_KEYUP As Integer = &H101
+        Private Const WM_CLOSE As Integer = &H10
+        Private Const WM_COMMAND As Integer = &H111
+        Private Const BM_CLICK As Integer = &HF5
         Private Const VK_RETURN As Integer = &HD
+        Private Const IDOK As Integer = 1
 
         Private _watchdog As Thread = Nothing
         Private _watchdogRun As Boolean = False
         Private _watchdogDismissals As Integer = 0
         Private _swProcessId As Integer = 0
 
-        Private Sub StartDialogWatchdog()
-            _watchdogDismissals = 0
+        ' When True, the watchdog stays up across the whole batch (set by
+        ' BatchRunner around Execute) instead of only during each RunAnalysis.
+        ' This closes the gap where a buckling dialog appears between the
+        ' per-run start/stop and blocks the batch.
+        Public Property KeepWatchdogAlive As Boolean = False
+
+        Public Sub StartDialogWatchdog()
+            ' Idempotent — don't spawn a second thread if one is already up.
+            If _watchdog IsNot Nothing AndAlso _watchdog.IsAlive Then
+                RefreshSwProcessId()
+                Return
+            End If
             _swProcessId = 0
-            Try
-                ' Resolve the SLDWORKS process id once so the watchdog only
-                ' touches dialogs owned by SolidWorks, never our own app.
-                For Each pr As System.Diagnostics.Process In _
-                    System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
-                    _swProcessId = pr.Id
-                    Exit For
-                Next
-            Catch
-            End Try
+            RefreshSwProcessId()
             _watchdogRun = True
             _watchdog = New Thread(AddressOf WatchdogLoop)
             _watchdog.IsBackground = True
             _watchdog.Start()
         End Sub
 
-        Private Sub StopDialogWatchdog()
+        Public Sub StopDialogWatchdog()
+            ' Honor the always-on flag: per-run stop calls become no-ops while
+            ' a batch holds the watchdog open.
+            If KeepWatchdogAlive Then Return
+            ForceStopDialogWatchdog()
+        End Sub
+
+        Public Sub ForceStopDialogWatchdog()
             _watchdogRun = False
             Try
                 If _watchdog IsNot Nothing Then _watchdog.Join(3000)
@@ -1941,41 +2358,185 @@ Imports SolidWorks.Interop.cosworks
             _watchdog = Nothing
         End Sub
 
+        Private Sub RefreshSwProcessId()
+            Try
+                ' Re-resolve each time — the pid changes after a mid-batch
+                ' SolidWorks restart, and a stale pid would make the watchdog
+                ' ignore the new instance's dialogs.
+                For Each pr As System.Diagnostics.Process In _
+                    System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
+                    _swProcessId = pr.Id
+                    Exit For
+                Next
+            Catch
+            End Try
+        End Sub
+
+        Private _watchdogLogPath As String = ""
+
         Private Sub WatchdogLoop()
-            ' Poll ~1s. Buckling raises TWO dialogs in sequence ("Solution
-            ' failure..." then "Program aborted. Press ENTER..."); a 1s cycle
-            ' catches both. Each #32770 owned by SLDWORKS gets an Enter posted.
+            ' Poll ~0.4s continuously. Scan EVERY top-level window on the
+            ' desktop; for any window belonging to the SLDWORKS process, also
+            ' recurse its children. A target is any #32770 dialog OR any window
+            ' whose title matches the known solver-failure captions. This makes
+            ' no assumption about the dialog's parentage — it cannot be missed.
+            Try
+                _watchdogLogPath = "C:\SpiderSW_Results\watchdog.log"
+                RefreshSwPidSet()
+                WdLog("──── watchdog start ──── sw pids=" & If(_swPidSet IsNot Nothing, _swPidSet.Count, 0))
+            Catch
+            End Try
+            Dim cycles As Integer = 0
             While _watchdogRun
                 Try
                     EnumWindows(AddressOf WatchdogEnum, IntPtr.Zero)
                 Catch
                 End Try
+                cycles += 1
+                If cycles >= 12 Then
+                    RefreshSwProcessId()
+                    RefreshSwPidSet()
+                    cycles = 0
+                End If
                 Dim waited As Integer = 0
-                While _watchdogRun AndAlso waited < 1000
-                    Thread.Sleep(200)
-                    waited += 200
+                While _watchdogRun AndAlso waited < 400
+                    Thread.Sleep(100)
+                    waited += 100
                 End While
             End While
+            WdLog("──── watchdog stop ──── dismissals=" & _watchdogDismissals)
         End Sub
 
-        Private Function WatchdogEnum(ByVal hWnd As IntPtr, ByVal l As IntPtr) As Boolean
+        Private Sub WdLog(ByVal msg As String)
             Try
-                If Not IsWindowVisible(hWnd) Then Return True
-                Dim pid As Integer = 0
-                GetWindowThreadProcessId(hWnd, pid)
-                If _swProcessId <> 0 AndAlso pid <> _swProcessId Then Return True
+                If _watchdogLogPath.Length > 0 Then
+                    System.IO.File.AppendAllText(_watchdogLogPath, _
+                        DateTime.Now.ToString("HH:mm:ss.fff") & "  " & msg & System.Environment.NewLine)
+                End If
+            Catch
+            End Try
+        End Sub
+
+        Private Function WindowText(ByVal hWnd As IntPtr) As String
+            Try
+                Dim sb As New System.Text.StringBuilder(512)
+                GetWindowText(hWnd, sb, 512)
+                Return sb.ToString()
+            Catch
+                Return ""
+            End Try
+        End Function
+
+        Private Function WindowClass(ByVal hWnd As IntPtr) As String
+            Try
                 Dim cn As New System.Text.StringBuilder(256)
                 GetClassName(hWnd, cn, 256)
-                If cn.ToString() = "#32770" Then
-                    ' Standard Windows dialog box owned by SolidWorks — dismiss.
-                    PostMessage(hWnd, WM_KEYDOWN, New IntPtr(VK_RETURN), IntPtr.Zero)
-                    PostMessage(hWnd, WM_KEYUP, New IntPtr(VK_RETURN), IntPtr.Zero)
-                    _watchdogDismissals += 1
+                Return cn.ToString()
+            Catch
+                Return ""
+            End Try
+        End Function
+
+        ' Top-level enumeration callback. For SLDWORKS-owned windows, recurse
+        ' into children too, then test this window as a possible dialog.
+        Private Function WatchdogEnum(ByVal hWnd As IntPtr, ByVal l As IntPtr) As Boolean
+            Try
+                Dim pid As Integer = 0
+                GetWindowThreadProcessId(hWnd, pid)
+
+                ' Recurse children of any SolidWorks-owned top-level window,
+                ' resolved by LIVE process name (not a cached PID, which is
+                ' wrong when SW was opened manually). This is what makes the
+                ' watchdog work regardless of who started SolidWorks.
+                If IsSolidWorksPid(pid) Then
+                    Try
+                        EnumChildWindows(hWnd, AddressOf WatchdogChildEnum, IntPtr.Zero)
+                    Catch
+                    End Try
                 End If
+
+                ' Test this top-level window itself (process-independent test)
+                TryDismissIfDialog(hWnd, pid)
             Catch
             End Try
             Return True
         End Function
+
+        ' Live check: is this pid a SLDWORKS process? Cached set, refreshed
+        ' periodically by the loop, so we don't spawn process queries per window.
+        Private _swPidSet As System.Collections.Generic.HashSet(Of Integer) = Nothing
+        Private Function IsSolidWorksPid(ByVal pid As Integer) As Boolean
+            Try
+                If _swPidSet Is Nothing Then Return False
+                Return _swPidSet.Contains(pid)
+            Catch
+            End Try
+            Return False
+        End Function
+
+        Private Sub RefreshSwPidSet()
+            Try
+                Dim s As New System.Collections.Generic.HashSet(Of Integer)()
+                For Each pr As System.Diagnostics.Process In _
+                    System.Diagnostics.Process.GetProcessesByName("SLDWORKS")
+                    s.Add(pr.Id)
+                Next
+                _swPidSet = s
+            Catch
+            End Try
+        End Sub
+
+        Private Function WatchdogChildEnum(ByVal hWnd As IntPtr, ByVal l As IntPtr) As Boolean
+            Try
+                Dim pid As Integer = 0
+                GetWindowThreadProcessId(hWnd, pid)
+                TryDismissIfDialog(hWnd, pid)
+            Catch
+            End Try
+            Return True
+        End Function
+
+        Private Sub TryDismissIfDialog(ByVal hWnd As IntPtr, ByVal pid As Integer)
+            If Not IsWindowVisible(hWnd) Then Return
+            Dim cls As String = WindowClass(hWnd)
+            If cls <> "#32770" Then Return
+
+            ' A real solver message box ALWAYS has a clickable button child.
+            ' A blank #32770 with no button is an internal SW shell — ignore.
+            Dim hBtn As IntPtr = FindWindowEx(hWnd, IntPtr.Zero, "Button", Nothing)
+            If hBtn = IntPtr.Zero Then Return
+
+            ' PROCESS-INDEPENDENT (fixed 2026-06-13): never gate on the SW
+            ' process id. When SW is opened MANUALLY the latched _swProcessId
+            ' is wrong/stale and every real dialog was being rejected — the
+            ' overnight failure. The ONLY hard exclusion is our OWN app's
+            ' process (so the pause/verify MessageBox is never auto-clicked).
+            ' Everything else that is a #32770-with-a-button is a solver dialog
+            ' we want gone, regardless of which process or who started SW.
+            Try
+                If pid = System.Diagnostics.Process.GetCurrentProcess().Id Then Return
+            Catch
+            End Try
+
+            ' Caption sanity: dismiss SolidWorks/solver dialogs. Match the known
+            ' captions, OR a blank/SolidWorks-titled dialog (the solver boxes
+            ' sometimes report an empty or generic title). This keeps us off
+            ' unrelated third-party app dialogs that happen to be #32770.
+            Dim title As String = WindowText(hWnd)
+            Dim tl As String = title.ToLower()
+            Dim isSolverDialog As Boolean = _
+                tl.Contains("nonlinear") OrElse tl.Contains("solution failure") OrElse _
+                tl.Contains("program aborted") OrElse tl.Contains("rotation") OrElse _
+                tl.Contains("step size") OrElse tl.Contains("singularity") OrElse _
+                tl.Contains("solidworks") OrElse tl.Contains("simulation") OrElse _
+                tl.Contains("cosmos") OrElse tl.Length = 0
+            If Not isSolverDialog Then Return
+
+            WdLog(String.Format("dialog hWnd={0} pid={1} cls='{2}' title='{3}' -> clicking", _
+                hWnd.ToInt64(), pid, cls, title))
+            SendMessage(hBtn, BM_CLICK, IntPtr.Zero, IntPtr.Zero)
+            _watchdogDismissals += 1
+        End Sub
 
         ' ──────────────────────────────────────────────────────────────
         ' STEP 4 — Mesh and Run
@@ -1987,6 +2548,12 @@ Imports SolidWorks.Interop.cosworks
                 ' Explicit FINEST standard high-quality mesh (campaign standard).
                 ' On failure, fall back to RunAnalysis auto-mesh (legacy behavior).
                 Dim meshed As Boolean = CreateFinestMesh()
+                If _solidMeshSkip Then
+                    Log("SKIP: solid mesh intractable for this row — not running.")
+                    Log("  No auto-mesh fallback (that path crashed SW on thin solids). SW left idle.")
+                    Log("  Route this configuration as a shell run, or run the thick-T solid rows.")
+                    Return False
+                End If
                 If Not meshed Then
                     Log("  Finest-mesh creation unavailable — RunAnalysis will auto-mesh")
                     Log("  (run 'Dump Sim API' to lock the SW2014 mesh call names)")
@@ -2224,7 +2791,13 @@ Imports SolidWorks.Interop.cosworks
                 ' ─── Phase 2: Match crest nodes by (R, Y) ───
                 ' Y_crest = ±H_eff depending on roll direction (FirstRollUp and roll index)
                 Dim crests As List(Of Double) = profile.GetRollCrestRadii()
-                Dim H_eff As Double = profile.H_pp / 2.0
+                ' Crown apex height differs by mode:
+                '  - Spider rolls: apex at ±H_pp/2 (H_pp is peak-to-peak)
+                '  - Edge (ComponentMode=1): H_pp IS the crown height used directly
+                '    (ED contract §3: H_pp used as H_eff, no second halving), so the
+                '    apex sits at ±H_pp. Using H_pp/2 here made the node-finder miss
+                '    the crown and grab an attach-line node (R off, Y=0, Kms0=0).
+                Dim H_eff As Double = If(profile.ComponentMode = 1, profile.H_pp, profile.H_pp / 2.0)
                 Dim crestNodeID(crests.Count - 1) As Integer
                 Dim crestNodeR(crests.Count - 1) As Double
                 Dim crestNodeY(crests.Count - 1) As Double
@@ -2300,6 +2873,20 @@ Imports SolidWorks.Interop.cosworks
                     Log("  ID edge nodeIDs failed: " & ex.Message)
                 End Try
 
+                ' HARD GATE (2026-08-18): an empty ID-edge node list means the
+                ' reaction sum below is a sum over nothing — every F would be 0
+                ' and the CSV would record a fake zero-stiffness run (root cause
+                ' of the L1 / BF-B all-zero rows in the tau ladder). Fail the
+                ' run loudly instead of writing zeros.
+                If idEdgeNodeIDs.Count = 0 Then
+                    Log("  *** ID edge node list EMPTY - GetDisplacementForEntities failed;")
+                    Log("  *** reaction extraction impossible. FAILING run (no CSV written). ***")
+                    Return False
+                End If
+                If idEdgeNodeIDs.Count < 60 Then
+                    Log(String.Format("  *** WARNING: only {0} ID edge nodes (typical ~124+) - reaction sum may undercount ***", idEdgeNodeIDs.Count))
+                End If
+
                 ' Build nodeID->array-index map from step 1 reaction array
                 Dim reactNodeIdx As New Dictionary(Of Integer, Integer)()
                 Dim reactStride As Integer = 9
@@ -2316,24 +2903,124 @@ Imports SolidWorks.Interop.cosworks
                 End Try
 
                 Dim fReact(stepCount-1) As Double
+                ' FIX (2026-08-18): F_reaction now sums Fy over the ENTIRE driven
+                ' ID region (all reacting nodes with R <= R_roll_start + 0.25mm),
+                ' not just the ID-edge ring. The ring captures only a geometry-
+                ' dependent share of the face reaction (measured 0.44 at A1/T0.42,
+                ' 0.067 at T0.55) — root cause of the store-wide Kms scale defect.
+                ' Verification per step: the fixed-lip OD-region sum must balance
+                ' the ID sum (equilibrium). Mismatch > 0.5% fails the run.
+                Dim rIDlim_F As Double = profile.R_roll_start + 0.25
+                Dim rODlim_F As Double = profile.R_rolls_outer - 0.25
+                Dim eqWorst As Double = 0.0
                 For iStep As Integer = 0 To stepCount - 1
                     Try
                         Dim st As Integer = 0
                         Dim oa() As Object = DirectCast( _
                             results.GetReactionForcesAndMoments(iStep+1, Nothing, 0, st), Object())
-                        Dim sumFy As Double = 0
-                        For Each nid As Integer In idEdgeNodeIDs
-                            If reactNodeIdx.ContainsKey(nid) Then
-                                sumFy += CDbl(oa(reactNodeIdx(nid)*reactStride + 2))
+                        Dim sumID As Double = 0, sumOD As Double = 0
+                        For ri As Integer = 0 To (oa.Length \ reactStride) - 1
+                            Dim nid3 As Integer = CInt(oa(ri * reactStride))
+                            Dim fy As Double = CDbl(oa(ri * reactStride + 2))
+                            If Math.Abs(fy) < 1.0E-12 Then Continue For
+                            Dim rr As Double = -1
+                            If nodeR.ContainsKey(nid3) Then rr = nodeR(nid3)
+                            If rr >= 0 AndAlso rr <= rIDlim_F Then
+                                sumID += fy
+                            ElseIf rr >= rODlim_F Then
+                                sumOD += fy
                             End If
                         Next
-                        fReact(iStep) = Math.Abs(sumFy)
+                        fReact(iStep) = Math.Abs(sumID)
+                        If fReact(iStep) > 1.0E-9 Then
+                            Dim eq As Double = Math.Abs(Math.Abs(sumID) - Math.Abs(sumOD)) / Math.Abs(sumID)
+                            If eq > eqWorst Then eqWorst = eq
+                        End If
                     Catch ex As Exception
                         fReact(iStep) = Double.NaN
                     End Try
                 Next
-                Log(String.Format("  F_reaction: step1={0:F4}N step13={1:F4}N  Kms_secant={2:F4}N/mm", _
+                Log(String.Format("  F_reaction (ID-region): step1={0:F4}N step13={1:F4}N  Kms_secant={2:F4}N/mm", _
                     fReact(0), fReact(stepCount-1), fReact(stepCount-1)/maxDisp_mm))
+                Log(String.Format("  Equilibrium check: worst |ID|-|OD| mismatch = {0:F3}%", eqWorst * 100.0))
+                If eqWorst > 0.005 Then
+                    Log("  *** EQUILIBRIUM FAIL: ID/OD reaction sums do not balance - force data untrustworthy. FAILING run. ***")
+                    Return False
+                End If
+                ' Zero-force gate: a displacement-driven run cannot produce zero
+                ' reaction at full stroke. All-zero means the prescribed displacement
+                ' never bound (L1/BF-B failure class). Fail instead of writing zeros.
+                If fReact(stepCount-1) < 1.0E-9 Then
+                    Log("  *** ZERO-FORCE: no reaction at final step - prescribed displacement did not bind. FAILING run. ***")
+                    Return False
+                End If
+
+                ' ─── Phase 4.1 DIAGNOSTIC (2026-08-18): reaction accounting audit ───
+                ' The edge-node sum above captures only the share of the driven-face
+                ' reaction carried by the inner ring. This block measures, at step 1
+                ' and the last step, three sums from the SAME reaction array:
+                '   sumEdge   = existing edge-node sum (what the CSV reports)
+                '   sumIDreg  = ALL reacting nodes with R <= R_roll_start + 0.25mm
+                '               (the entire driven flange region = true ID reaction)
+                '   sumODreg  = ALL reacting nodes with R >= R_rolls_outer - 0.25mm
+                '               (fixed lip; equilibrium partner, sign-opposite)
+                ' It also dumps every reacting node (id, R, Y, Fy) at step 1 to
+                ' <OutputDir>\<stem>_reactions.csv so the capture share is measured,
+                ' not inferred. CSV columns and F_reaction remain UNCHANGED.
+                Try
+                    Dim rIDlim As Double = profile.R_roll_start + 0.25
+                    Dim rODlim As Double = profile.R_rolls_outer - 0.25
+                    For Each dStep As Integer In New Integer() {1, stepCount}
+                        Dim st2 As Integer = 0
+                        Dim oa2() As Object = DirectCast( _
+                            results.GetReactionForcesAndMoments(dStep, Nothing, 0, st2), Object())
+                        Dim sumEdge As Double = 0, sumIDreg As Double = 0, sumODreg As Double = 0, sumAll As Double = 0
+                        Dim nID As Integer = 0, nOD As Integer = 0, nOther As Integer = 0
+                        Dim dumpSb As System.Text.StringBuilder = Nothing
+                        If dStep = 1 Then
+                            dumpSb = New System.Text.StringBuilder()
+                            dumpSb.AppendLine("NodeID,R_mm,Y_mm,Fy_N,Region")
+                        End If
+                        For ri As Integer = 0 To (oa2.Length \ reactStride) - 1
+                            Dim nid2 As Integer = CInt(oa2(ri * reactStride))
+                            Dim fy As Double = CDbl(oa2(ri * reactStride + 2))
+                            If Math.Abs(fy) < 1.0E-12 Then Continue For
+                            sumAll += fy
+                            Dim rr As Double = -1, yy As Double = 0
+                            If nodeR.ContainsKey(nid2) Then rr = nodeR(nid2)
+                            If nodeY.ContainsKey(nid2) Then yy = nodeY(nid2)
+                            Dim region As String = "OTHER"
+                            If rr >= 0 AndAlso rr <= rIDlim Then
+                                sumIDreg += fy : nID += 1 : region = "ID"
+                            ElseIf rr >= rODlim Then
+                                sumODreg += fy : nOD += 1 : region = "OD"
+                            Else
+                                nOther += 1
+                            End If
+                            If idEdgeNodeIDs.Contains(nid2) Then sumEdge += fy : region = region & "+EDGE"
+                            If dumpSb IsNot Nothing Then
+                                dumpSb.AppendLine(String.Format("{0},{1:F3},{2:F3},{3:E6},{4}", nid2, rr, yy, fy, region))
+                            End If
+                        Next
+                        Log(String.Format("  REACTION AUDIT step {0}: edgeSum={1:F5}N  IDregion={2:F5}N  ODregion={3:F5}N  ALL={4:F5}N  (nID={5} nOD={6} nOther={7})", _
+                            dStep, Math.Abs(sumEdge), Math.Abs(sumIDreg), Math.Abs(sumODreg), sumAll, nID, nOD, nOther))
+                        If dStep = 1 AndAlso Math.Abs(sumIDreg) > 1.0E-12 Then
+                            Log(String.Format("  REACTION AUDIT: edge/IDregion capture share = {0:F4}", _
+                                Math.Abs(sumEdge) / Math.Abs(sumIDreg)))
+                        End If
+                        If dumpSb IsNot Nothing Then
+                            Try
+                                Dim dumpPath As String = outputPath.Replace("_auto.csv", "_reactions.csv")
+                                System.IO.File.WriteAllText(dumpPath, dumpSb.ToString())
+                                Log("  Reaction dump: " & dumpPath)
+                            Catch exD As Exception
+                                Log("  Reaction dump write failed: " & exD.Message)
+                            End Try
+                        End If
+                    Next
+                Catch exA As Exception
+                    Log("  REACTION AUDIT failed: " & exA.Message)
+                End Try
 
                 ' ─── Phase 4.5: Tier 3 via GetMinMaxStress (one call per step) ───────
                 ' Fast path: ~50 calls total. <1 second on a 10k-node mesh.
@@ -2417,6 +3104,12 @@ Imports SolidWorks.Interop.cosworks
                 sb.AppendLine()
                 sb.AppendLine(String.Format("# ID={0} OD={1} N={2} H_pp={3} T={4} E={5} Nu={6} Density={7} Material={8}", _
                     profile.ID, profile.OD, profile.N, profile.H_pp, profile.T, profile.E, profile.Nu, profile.Density, profile.MaterialName))
+                If profile.ProfileType = 11 Then
+                    ' Self-describing DoubleRoll CenterFlat. effective = value actually
+                    ' built after the span*0.8 clamp; distiller keys on effective.
+                    sb.AppendLine(String.Format("# DoubleRoll CenterFlat (mm): nominal={0:F2} effective={1:F2}", _
+                        profile.CenterFlat, profile.EffectiveCenterFlat))
+                End If
                 sb.AppendLine(String.Format("# Roll crests R (mm): " & String.Join(", ", _
                     crests.ConvertAll(Function(r) r.ToString("F2")).ToArray())))
                 sb.AppendLine(String.Format("# Crest node IDs: " & String.Join(", ", _
@@ -2452,6 +3145,23 @@ Imports SolidWorks.Interop.cosworks
 
                 System.IO.File.WriteAllText(outputPath, sb.ToString())
                 Log("  CSV: " & outputPath)
+                ' Read-back: confirm the auto.csv actually landed. It has been seen
+                ' absent while profile.csv/DONE.txt (written after) persisted — a
+                ' write that returned without error but left no file. Retry once,
+                ' then fail the run rather than let it stamp PASS on a missing file.
+                If Not System.IO.File.Exists(outputPath) Then
+                    Log("  WARNING: auto.csv not on disk after write — retrying once")
+                    Try
+                        System.IO.File.WriteAllText(outputPath, sb.ToString())
+                    Catch exRetry As Exception
+                        Log("  retry write threw: " & exRetry.Message)
+                    End Try
+                    If Not System.IO.File.Exists(outputPath) Then
+                        Log("  ERROR: auto.csv did not persist: " & outputPath)
+                        Return False
+                    End If
+                    Log("  auto.csv landed on retry")
+                End If
 
                 ' ─── Phase 6: _profile.csv (Tier 2 = 10 deciles, Tier 1 = stress at θ=0 slice) ───
                 Log("  Extracting profile cross-section...")

@@ -40,6 +40,7 @@ Public Class BatchRow
     Public VariablePitch As Boolean = False
     Public PitchTaperPct As Double = 0.0
     Public UseNaturalH As Boolean = False
+    Public SolidMesh As Boolean = False    ' True = thin-wall solid + solid mesh (high-T recovery); False = shell
 
     ' ── Material ──
     Public MaterialName As String = "Rubber"
@@ -91,6 +92,7 @@ Public Class BatchRow
         p.VariablePitch = VariablePitch
         p.PitchTaperPct = PitchTaperPct
         p.UseNaturalH = UseNaturalH
+        p.SolidMesh = SolidMesh
         p.MaterialName = MaterialName
         p.E = E
         p.Nu = Nu
@@ -260,7 +262,7 @@ Public Class SweepMatrix
         "ConnAngle", "SLen", "CenterFlat", "BulletR_Top", "BulletCx", _
         "TaperPct", "VariablePitch", "PitchTaperPct", "UseNaturalH", _
         "Material", "E", "Nu", "Density", "MaxDisp", "Steps", "Direction", _
-        "OutputDir", "Message"}
+        "OutputDir", "Message", "SolidMesh"}
 
     Public Shared Sub SaveCsv(ByVal rows As List(Of BatchRow), ByVal path As String)
         Dim sb As New StringBuilder()
@@ -278,7 +280,8 @@ Public Class SweepMatrix
                 r.PitchTaperPct.ToString(), r.UseNaturalH.ToString(), _
                 CsvSafe(r.MaterialName), r.E.ToString(), r.Nu.ToString(), _
                 r.Density.ToString(), r.MaxDisp.ToString(), r.Steps.ToString(), _
-                r.Direction, CsvSafe(r.OutputDir), CsvSafe(r.Message)}
+                r.Direction, CsvSafe(r.OutputDir), CsvSafe(r.Message), _
+                r.SolidMesh.ToString()}
             sb.AppendLine(String.Join(",", f))
         Next
         System.IO.File.WriteAllText(path, sb.ToString())
@@ -333,6 +336,7 @@ Public Class SweepMatrix
             r.Direction = GetS(f, ix, "Direction", "Push")
             r.OutputDir = GetS(f, ix, "OutputDir", "C:\SpiderSW_Results\Spider_Asymmetry")
             r.Message = GetS(f, ix, "Message", "")
+            r.SolidMesh = GetB(f, ix, "SolidMesh", False)
             rows.Add(r)
         Next
         Return rows

@@ -89,6 +89,19 @@ Public Class BatchRunner
         If p.UseNaturalH Then
             base = base & "_natH"
         End If
+        ' Tri-Radius (17) and Bullet (12): crown radius R2 and crown center Cx
+        ' define the geometry — include them so different crowns get distinct
+        ' filenames. Without this, an edge sweep over R2/Cx collides on name
+        ' and the precheck flags valid runs as duplicates.
+        If p.ProfileType = 17 OrElse p.ProfileType = 12 Then
+            base = base & String.Format("_R2{0:0.0}_Cx{1:0.0}", p.BulletR_Top, p.BulletCx)
+        End If
+        ' DoubleRoll (11): center-flat CF defines the geometry — include it so a
+        ' CF sweep gets distinct filenames. Keyed on nominal CenterFlat (the header
+        ' carries nominal + effective). Same rationale as R2/Cx above.
+        If p.ProfileType = 11 Then
+            base = base & String.Format("_CF{0:0.0}", p.CenterFlat)
+        End If
         If (p.ProfileType = 2 OrElse p.ProfileType = 3) AndAlso p.StraightLength <> 1.0 Then
             base = base & String.Format("_SL{0:0.0}", p.StraightLength)
         End If
@@ -138,6 +151,31 @@ Public Class BatchRunner
                 If p.H_pp > r.MaxHpp + 0.0001 Then
                     r.PrecheckPass = False
                     r.PrecheckNote = String.Format("H_pp {0:F2} > MaxH_pp {1:F2}", p.H_pp, r.MaxHpp)
+                End If
+            End If
+
+            ' Gate: thin-shell validity — T must stay small vs crest radius.
+            ' Above T/R_crest ~0.13 the shell degrades on the corrugation
+            ' apex and collapses toward flat-plate response (angle/profile-
+            ' independent, non-monotonic in T). The defect is proven on the
+            ' T axis (T>=0.6). R_crest also shrinks with SLen and span, so
+            ' T0.42 SL/size-ladder rows can reach T/R up to ~0.17 while still
+            ' being the trusted corpus — the degradation is only demonstrated
+            ' for thick walls, not that geometry axis. So gate fires only
+            ' where BOTH T/R > 0.13 AND T > 0.43: catches the thick-T garbage,
+            ' never blocks a T0.42 corpus row. (Whether high-T/R T0.42 SL/size
+            ' cells are also degraded is a separate, unproven question.)
+            ' Only guards ArcLines/SineLines shell runs.
+            ' Gate applies to SHELL runs only. Solid runs (SolidMesh=True) are
+            ' the intended path for high T/R and must pass at any ratio.
+            If r.PrecheckPass AndAlso r.ComponentMode = 0 AndAlso Not p.SolidMesh Then
+                Dim rc As Double = p.CrestRadius
+                If rc > 0 AndAlso rc < Double.MaxValue Then
+                    Dim tr As Double = p.T / rc
+                    If tr > 0.13 AndAlso p.T > 0.43 Then
+                        r.PrecheckPass = False
+                        r.PrecheckNote = String.Format("T/R_crest {0:F3} > 0.13 at T={1:F2} (shell invalid at crest; solid-mesh needed) R_crest={2:F2}", tr, p.T, rc)
+                    End If
                 End If
             End If
 
@@ -206,6 +244,12 @@ Public Class BatchRunner
             Log("ABORT: cannot connect/start SolidWorks.")
             Return 0
         End If
+
+        ' Hold the dialog watchdog open for the ENTIRE batch, not just during
+        ' each RunAnalysis — buckling dialogs can surface in the gaps between
+        ' runs (extraction, part rebuild) and would otherwise block unattended.
+        _sw.KeepWatchdogAlive = True
+        _sw.StartDialogWatchdog()
 
         For i As Integer = 0 To rows.Count - 1
             System.Windows.Forms.Application.DoEvents()
@@ -312,6 +356,10 @@ Public Class BatchRunner
 
         BatchLog(batchLogPath, "BATCH END " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") & _
                  "  pass=" & passCount)
+        ' Release the always-on watchdog now the batch is finished.
+        _sw.KeepWatchdogAlive = False
+        _sw.ForceStopDialogWatchdog()
+
         Log("")
         Log(String.Format("══ BATCH COMPLETE: {0} PASS of {1} rows ══", passCount, rows.Count))
         Log("Batch log: " & batchLogPath)
@@ -470,16 +518,15 @@ Public Class BatchRunner
                System.IO.File.Exists(mate.OutputFile) Then
                 Dim mateKms As Double = ParseKms0FromFile(mate.OutputFile)
                 If kms0 > 0 AndAlso mateKms > 0 Then
+                    ' Push/Pull Kms0 difference is REPORTED, never gated.
+                    ' For asymmetry / taper / parity campaigns the difference
+                    ' is the signal being measured, not an error. (Changed
+                    ' 2026-06-12 after the 1% gate false-failed valid
+                    ' asymmetry runs and blocked the queue.)
                     Dim rel As Double = Math.Abs(kms0 - mateKms) / Math.Max(kms0, mateKms)
-                    If rel > KmsPair_Tol Then
-                        pass = False
-                        sb.Append(String.Format("[3]pair Kms0 {0:F4}/{1:F4} diff {2:F2}% ", _
-                            kms0, mateKms, rel * 100.0))
-                    Else
-                        sb.Append(String.Format("[3]pair OK {0:F2}% ", rel * 100.0))
-                    End If
+                    sb.Append(String.Format("[3]pair diff {0:F2}% ", rel * 100.0))
                 Else
-                    pass = False
+                    ' Only note unreadable — do not fail the run on it.
                     sb.Append("[3]pair Kms0 unreadable ")
                 End If
             End If

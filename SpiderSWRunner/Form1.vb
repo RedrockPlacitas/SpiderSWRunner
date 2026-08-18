@@ -331,8 +331,8 @@ Imports Microsoft.VisualBasic
             lblBulletRtop.Visible = isTriRadius
             tbBulletRtop.Visible = isTriRadius
             If isTriRadius Then
-                lblBulletRid.Text = "R2 Rad:"
-                lblBulletRtop.Text = "R2 Ctr:"
+                lblBulletRid.Text = "R2 Ctr:"
+                lblBulletRtop.Text = "R2 Rad:"
                 ' Reposition next to Profile combo (where ConnAngle normally sits)
                 ' Profile combo is at (70, yRow), so these go right of it
                 Dim yRow As Integer = cbProfile.Location.Y
@@ -587,12 +587,18 @@ Imports Microsoft.VisualBasic
         Private Sub btnProbeStress_Click(ByVal sender As Object, ByVal e As EventArgs) _
             Handles btnProbeStress.Click
             ' ─────────────────────────────────────────────────────────
-            ' Runs SWAutomation.EnumerateResults — probes for batch stress API.
-            ' Requires: SW open, part loaded, study solved, ID/OD in GUI match
-            ' the open part. No files written. Logs only.
+            ' 1) ProbeShellMaterial — dumps the active study's shell
+            '    material state (ModelType, MooneyRivlinConstants,
+            '    MOONEY_A/MOONEY_B/EX/NUXY/GXY/DENS). Read-only, works
+            '    PRE-solve; run it after manually setting Mooney in the
+            '    study dialog to capture the known-good state.
+            ' 2) EnumerateResults — probes for batch stress API.
+            '    Requires a SOLVED study; logs "no results" otherwise.
+            ' No files written. Logs only.
             ' ─────────────────────────────────────────────────────────
             Cursor = Cursors.WaitCursor
             Try
+                _sw.ProbeShellMaterial()
                 Dim p = BuildProfile()
                 _sw.EnumerateResults(p)
             Catch ex As System.Exception

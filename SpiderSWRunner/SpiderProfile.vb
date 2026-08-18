@@ -69,6 +69,12 @@ Imports System.Text
         ' 0 = Spider, 1 = Edge
         Public ComponentMode As Integer = 0
 
+        ' When True, build a thin-wall SOLID of wall thickness T and solid-mesh
+        ' it, instead of a zero-thickness surface + shell thickness. Used to
+        ' recover valid stiffness at high T/R_crest where the shell formulation
+        ' degrades on the corrugation apex. Default False = shell (the corpus).
+        Public SolidMesh As Boolean = False
+
         ' ── Geometry inputs ──
         Public ID As Double = 67.0
         Public OD As Double = 172.0
@@ -192,10 +198,28 @@ Imports System.Text
             Get
                 If ProfileType = 11 Then
                     Dim span As Double = R_rolls_outer - R_roll_start
-                    Dim flat As Double = Math.Max(0, Math.Min(CenterFlat, span * 0.8))
-                    Return (span - flat) / 2.0
+                    Dim nRolls As Integer = Math.Max(1, N)
+                    Dim total_flat As Double = If(nRolls > 1, Math.Max(0.0, Math.Min((nRolls - 1) * CenterFlat, span * 0.8)), 0.0)
+                    Return (span - total_flat) / nRolls
                 End If
                 Return EffPitch
+            End Get
+        End Property
+
+        ''' <summary>
+        ''' Effective per-gap CenterFlat actually built for DoubleRoll after the
+        ''' span*0.8 clamp in GetDoubleRollArcs. Equals nominal CenterFlat when the
+        ''' requested flats fit; smaller when clamped. Non-DoubleRoll returns
+        ''' CenterFlat unchanged. This is the value the distiller keys DoubleRoll CF on.
+        ''' </summary>
+        Public ReadOnly Property EffectiveCenterFlat As Double
+            Get
+                If ProfileType = 11 AndAlso N > 1 Then
+                    Dim span As Double = R_rolls_outer - R_roll_start
+                    Dim total_flat As Double = Math.Max(0.0, Math.Min((N - 1) * CenterFlat, span * 0.8))
+                    Return total_flat / (N - 1)
+                End If
+                Return CenterFlat
             End Get
         End Property
 
@@ -216,6 +240,34 @@ Imports System.Text
                 Dim p As Double = EffPitchPerRoll
                 If p <= 0 Then Return 0
                 Return H_eff / p
+            End Get
+        End Property
+
+        ' ══════════════════════════════════════════════════════════════
+        ' Crest radius of curvature (mm) at the corrugation apex.
+        ' For ArcLines (2) / SineLines (3) the crest is a circular arc of
+        ' radius a_half/sin(theta) — identical to the arc built in
+        ' GeneratePoints_ArcLines. This is the tightest curvature in the
+        ' part and sets the thin-shell validity limit: shell results are
+        ' only valid while shell thickness T is small vs this radius.
+        ' Returns Double.MaxValue for profiles where it is not computed
+        ' here (unguarded), so a T/R test on those reads ~0.
+        ' ══════════════════════════════════════════════════════════════
+        Public ReadOnly Property CrestRadius As Double
+            Get
+                If ProfileType <> 2 AndAlso ProfileType <> 3 Then Return Double.MaxValue
+                Dim p As Double = EffPitchPerRoll
+                If p <= 0 Then Return Double.MaxValue
+                Dim th As Double = ConnectorAngle * Math.PI / 180.0
+                Dim sth As Double = Math.Sin(th)
+                Dim cth As Double = Math.Cos(th)
+                If sth <= 0.001 Then Return Double.MaxValue
+                Dim s As Double = Math.Max(0.0, Math.Min(StraightLength, p * 0.48))
+                Dim r_j As Double = (s / 2.0) * cth
+                Dim wa As Double = p - 2.0 * r_j
+                If wa <= 0.001 Then Return Double.MaxValue
+                Dim a_half As Double = wa / 2.0
+                Return a_half / sth
             End Get
         End Property
 
@@ -502,14 +554,28 @@ Imports System.Text
         Public Function GetCircularArcRolls() As List(Of CircularArcRoll)
             Dim rolls As New List(Of CircularArcRoll)
             Dim pitch   As Double = EffPitch
-            Dim h       As Double = H_eff
             Dim half_hp As Double = pitch / 2.0
-            If h <= 0.0001 OrElse pitch <= 0.0001 Then Return rolls
+            If H_eff <= 0.0001 OrElse pitch <= 0.0001 Then Return rolls
 
-            Dim R_arc   As Double = (h * h + half_hp * half_hp) / (2.0 * h)
-            Dim ZcUp    As Double = (h * h - half_hp * half_hp) / (2.0 * h)
+            ' Per-roll tapered heights. This function previously used a single
+            ' flat h = H_eff for every roll and computed the arc radius/centre
+            ' once outside the loop, so TaperPct (§4.4) was silently discarded
+            ' for CircularArc — every taper level produced byte-identical
+            ' geometry, mesh, and results. H_eff_roll(roll) carries the per-roll
+            ' tapered height (at TaperPct=0 it equals H_eff for all rolls, so the
+            ' untapered baseline is unchanged). R_arc/ZcUp now recompute per roll.
+            ' NOTE (separate gap, not fixed here): pitch/spacing stay uniform —
+            ' CircularArc still does not consume rm.RollStart/rm.Pitch, so
+            ' VariablePitch has no effect on this profile. Raise before any
+            ' variable-pitch CircularArc run.
+            Dim rm As RollMetrics = ComputeRollMetrics()
 
             For roll As Integer = 0 To N - 1
+                Dim h As Double = rm.H_eff_roll(roll)
+                If h <= 0.0001 Then h = 0.0001
+                Dim R_arc As Double = (h * h + half_hp * half_hp) / (2.0 * h)
+                Dim ZcUp  As Double = (h * h - half_hp * half_hp) / (2.0 * h)
+
                 Dim isUp    As Boolean = If(roll Mod 2 = 0, FirstRollUp, Not FirstRollUp)
                 Dim rs      As Double  = R_roll_start + roll * pitch
                 Dim re      As Double  = rs + pitch
@@ -575,7 +641,7 @@ Imports System.Text
         Public Function GetHalfRollArc() As List(Of CircularArcRoll)
             Dim rolls As New List(Of CircularArcRoll)
             Dim span    As Double = R_rolls_outer - R_roll_start
-            Dim h       As Double = H_eff
+            Dim h       As Double = If(ComponentMode = 1, H_pp, H_eff)
             Dim half_hp As Double = span / 2.0
             If h <= 0.0001 OrElse span <= 0.0001 Then Return rolls
 
@@ -650,9 +716,15 @@ Imports System.Text
         Public Function GetDoubleRollArcs() As List(Of CircularArcRoll)
             Dim rolls As New List(Of CircularArcRoll)
             Dim span As Double = R_rolls_outer - R_roll_start
-            Dim flat As Double = Math.Max(0.0, Math.Min(CenterFlat, span * 0.8))
-            Dim roll_pitch As Double = (span - flat) / 2.0
-            Dim h As Double = H_eff
+            Dim nRolls As Integer = Math.Max(1, N)
+            ' Generalized: N same-direction rolls with (N-1) connecting flats.
+            ' N=2 reproduces the original DoubleRoll exactly.
+            Dim total_flat As Double = If(nRolls > 1, Math.Max(0.0, Math.Min((nRolls - 1) * CenterFlat, span * 0.8)), 0.0)
+            Dim flat As Double = If(nRolls > 1, total_flat / (nRolls - 1), 0.0)
+            Dim roll_pitch As Double = (span - total_flat) / nRolls
+            ' Edge (ComponentMode=1): crest height is the full H_pp (same-direction
+            ' rolls, no peak-to-peak halving). Spider: H_eff = H_pp/2.
+            Dim h As Double = If(ComponentMode = 1, H_pp, H_eff)
             Dim half_hp As Double = roll_pitch / 2.0
             If h <= 0.0001 OrElse roll_pitch <= 0.0001 Then Return rolls
 
@@ -660,26 +732,17 @@ Imports System.Text
             Dim ZcVal As Double = (h * h - half_hp * half_hp) / (2.0 * h)
             Dim Zc As Double = If(FirstRollUp, ZcVal, -ZcVal)
 
-            ' Roll 1
-            Dim rl1 As New CircularArcRoll()
-            rl1.R_start = R_roll_start
-            rl1.R_end = R_roll_start + roll_pitch
-            rl1.Rc = R_roll_start + half_hp
-            rl1.Zc = Zc
-            rl1.R_arc = R_arc
-            rl1.IsUp = FirstRollUp
-            rolls.Add(rl1)
-
-            ' Roll 2 (same direction as roll 1)
-            Dim r2_start As Double = R_roll_start + roll_pitch + flat
-            Dim rl2 As New CircularArcRoll()
-            rl2.R_start = r2_start
-            rl2.R_end = r2_start + roll_pitch
-            rl2.Rc = r2_start + half_hp
-            rl2.Zc = Zc
-            rl2.R_arc = R_arc
-            rl2.IsUp = FirstRollUp
-            rolls.Add(rl2)
+            For i As Integer = 0 To nRolls - 1
+                Dim r_start As Double = R_roll_start + i * (roll_pitch + flat)
+                Dim rl As New CircularArcRoll()
+                rl.R_start = r_start
+                rl.R_end = r_start + roll_pitch
+                rl.Rc = r_start + half_hp
+                rl.Zc = Zc
+                rl.R_arc = R_arc
+                rl.IsUp = FirstRollUp
+                rolls.Add(rl)
+            Next
 
             Return rolls
         End Function
@@ -1072,7 +1135,7 @@ Imports System.Text
             Dim pts As New List(Of ProfilePoint)
             Dim PI As Double = Math.PI
             Dim span As Double = R_rolls_outer - R_roll_start
-            Dim h As Double = H_eff
+            Dim h As Double = If(ComponentMode = 1, H_pp, H_eff)
             Dim thetaDeg As Double = Math.Max(10.0, Math.Min(180.0, ConnectorAngle))
             Dim thetaRad As Double = thetaDeg * PI / 180.0
             Dim halfTheta As Double = thetaRad / 2.0
@@ -1600,13 +1663,16 @@ Imports System.Text
             End If
 
             If ProfileType = 11 Then
-                ' DoubleRoll: crest of each roll
+                ' DoubleRoll: crest of each of N same-direction rolls (matches GetDoubleRollArcs)
                 Dim crests As New List(Of Double)()
                 Dim span As Double = R_rolls_outer - R_roll_start
-                Dim flat As Double = Math.Max(0.0, Math.Min(CenterFlat, span * 0.8))
-                Dim roll_pitch As Double = (span - flat) / 2.0
-                crests.Add(R_roll_start + roll_pitch / 2.0)
-                crests.Add(R_roll_start + roll_pitch + flat + roll_pitch / 2.0)
+                Dim nRolls As Integer = Math.Max(1, N)
+                Dim total_flat As Double = If(nRolls > 1, Math.Max(0.0, Math.Min((nRolls - 1) * CenterFlat, span * 0.8)), 0.0)
+                Dim flat As Double = If(nRolls > 1, total_flat / (nRolls - 1), 0.0)
+                Dim roll_pitch As Double = (span - total_flat) / nRolls
+                For i As Integer = 0 To nRolls - 1
+                    crests.Add(R_roll_start + i * (roll_pitch + flat) + roll_pitch / 2.0)
+                Next
                 Return crests
             End If
 
@@ -1642,9 +1708,15 @@ Imports System.Text
             End If
 
             If ProfileType = 17 Then
-                ' TriRadius: crest at midpoint (placeholder)
+                ' TriRadius crown center honors Cx (inner-edge referenced),
+                ' same as Bullet type 12: crest at R_inner + Cx. Previously this
+                ' returned the span midpoint regardless of Cx ("placeholder"),
+                ' which made the node-finder target the centered position for
+                ' every case and silently hid off-center crowns. The build
+                ' already drives R2 Center = R_inner + GetBulletCx(); this makes
+                ' the result-probe target match the built geometry.
                 Dim crests As New List(Of Double)()
-                crests.Add(R_roll_start + (R_rolls_outer - R_roll_start) / 2.0)
+                crests.Add(R_inner + GetBulletCx())
                 Return crests
             End If
 
