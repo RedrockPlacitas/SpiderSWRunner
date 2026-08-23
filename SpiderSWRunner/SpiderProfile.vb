@@ -74,6 +74,10 @@ Imports System.Text
         ' recover valid stiffness at high T/R_crest where the shell formulation
         ' degrades on the corrugation apex. Default False = shell (the corpus).
         Public SolidMesh As Boolean = False
+        ' MeshScale (2026-08-20): multiplier on SW's default element size for the
+        ' shell mesh. 0.5 = campaign standard (finest). Larger = coarser.
+        ' Explicit CSV column so mesh density can never live in prose again.
+        Public MeshScale As Double = 0.5
 
         ' ── Geometry inputs ──
         Public ID As Double = 67.0

@@ -27,6 +27,8 @@ Imports SolidWorks.Interop.cosworks
         ' Persist solid-mesh state for CreateFinestMesh (which takes no profile).
         ' A thin-wall solid needs element size small vs the wall or it meshes zero.
         Private _solidMesh As Boolean = False
+        Private _meshScale As Double = 0.5
+        Private Shared _lastBindShare As Double = 0.0
         Private _wallT As Double = 0.0
         ' Set True inside CreateFinestMesh when a solid row's estimated element
         ' count exceeds the ceiling (thin wall over a large ring). MeshAndRun
@@ -688,6 +690,8 @@ Imports SolidWorks.Interop.cosworks
 
                 Dim feat As Object
                 _solidMesh = profile.SolidMesh
+                _meshScale = profile.MeshScale
+                If _meshScale <= 0.0 Then _meshScale = 0.5
                 _wallT = profile.T
                 If profile.SolidMesh Then
                     ' Thin-wall SOLID of wall thickness T (SW revolve thickness is
@@ -2012,8 +2016,9 @@ Imports SolidWorks.Interop.cosworks
                         Log("  Default element size non-positive — auto-mesh fallback")
                         Return False
                     End If
-                    fineEl = elSize * 0.5
-                    fineTol = tol * 0.5
+                    fineEl = elSize * _meshScale
+                    fineTol = tol * _meshScale
+                    Log(String.Format("  MeshScale = {0:F3} (0.5 = campaign standard)", _meshScale))
                 End If
 
                 Log(String.Format("  Creating FINEST mesh: el={0:F4}mm tol={1:F5}mm ...", fineEl, fineTol))
@@ -2975,6 +2980,8 @@ Imports SolidWorks.Interop.cosworks
                         Dim oa2() As Object = DirectCast( _
                             results.GetReactionForcesAndMoments(dStep, Nothing, 0, st2), Object())
                         Dim sumEdge As Double = 0, sumIDreg As Double = 0, sumODreg As Double = 0, sumAll As Double = 0
+                        Dim rIDmin As Double = 1.0E9, rIDmax As Double = -1.0E9
+                        Dim rODmin As Double = 1.0E9, rODmax As Double = -1.0E9
                         Dim nID As Integer = 0, nOD As Integer = 0, nOther As Integer = 0
                         Dim dumpSb As System.Text.StringBuilder = Nothing
                         If dStep = 1 Then
@@ -2998,6 +3005,12 @@ Imports SolidWorks.Interop.cosworks
                                 nOther += 1
                             End If
                             If idEdgeNodeIDs.Contains(nid2) Then sumEdge += fy : region = region & "+EDGE"
+                            If rr >= 0 Then
+                                If region.StartsWith("ID") AndAlso rr < rIDmin Then rIDmin = rr
+                                If region.StartsWith("ID") AndAlso rr > rIDmax Then rIDmax = rr
+                                If region.StartsWith("OD") AndAlso rr < rODmin Then rODmin = rr
+                                If region.StartsWith("OD") AndAlso rr > rODmax Then rODmax = rr
+                            End If
                             If dumpSb IsNot Nothing Then
                                 dumpSb.AppendLine(String.Format("{0},{1:F3},{2:F3},{3:E6},{4}", nid2, rr, yy, fy, region))
                             End If
@@ -3005,8 +3018,33 @@ Imports SolidWorks.Interop.cosworks
                         Log(String.Format("  REACTION AUDIT step {0}: edgeSum={1:F5}N  IDregion={2:F5}N  ODregion={3:F5}N  ALL={4:F5}N  (nID={5} nOD={6} nOther={7})", _
                             dStep, Math.Abs(sumEdge), Math.Abs(sumIDreg), Math.Abs(sumODreg), sumAll, nID, nOD, nOther))
                         If dStep = 1 AndAlso Math.Abs(sumIDreg) > 1.0E-12 Then
-                            Log(String.Format("  REACTION AUDIT: edge/IDregion capture share = {0:F4}", _
-                                Math.Abs(sumEdge) / Math.Abs(sumIDreg)))
+                            Dim capShare As Double = Math.Abs(sumEdge) / Math.Abs(sumIDreg)
+                            Log(String.Format("  REACTION AUDIT: edge/IDregion capture share = {0:F4}", capShare))
+                            ' W_free (2026-08-20): clamped-to-clamped free radial span, measured
+                            ' from the entities that actually reacted. Self-documents the
+                            ' MaxDisp = 0.55 * W_free rule instead of leaving it in prose.
+                            If rIDmin < 1.0E8 AndAlso rODmax > -1.0E8 Then
+                                Dim wFree As Double = rODmin - rIDmax
+                                Log(String.Format("  W_FREE: ID bound R {0:F3}..{1:F3} mm | OD bound R {2:F3}..{3:F3} mm | W_free = {4:F3} mm | 0.55*W_free = {5:F3} mm", _
+                                    rIDmin, rIDmax, rODmin, rODmax, wFree, 0.55 * wFree))
+                            End If
+                            ' Binding classification, recorded per run rather than inferred
+                            ' from family. InvRoll cloth at H_pp 18 bound to the EDGE where
+                            ' the rest of its family bound to the FACE - so this must be data.
+                            If capShare > 0.98 AndAlso capShare < 1.02 Then
+                                Log("  BINDING: EDGE-bound (capture share ~1.0) - legacy extraction was CORRECT for this run")
+                            Else
+                                Log(String.Format("  BINDING: FACE-bound (capture share {0:F4}) - legacy extraction UNDERCOUNTED this run", capShare))
+                            End If
+                            If _lastBindShare > 0.0 Then
+                                Dim wasEdge As Boolean = (_lastBindShare > 0.98 AndAlso _lastBindShare < 1.02)
+                                Dim nowEdge As Boolean = (capShare > 0.98 AndAlso capShare < 1.02)
+                                If wasEdge <> nowEdge Then
+                                    Log("  *** BINDING FLIP: this run bound differently than the previous run in this batch ***")
+                                    Log(String.Format("  *** previous share = {0:F4}, this share = {1:F4} - anchor set needs a note ***", _lastBindShare, capShare))
+                                End If
+                            End If
+                            _lastBindShare = capShare
                         End If
                         If dumpSb IsNot Nothing Then
                             Try
@@ -3104,6 +3142,28 @@ Imports SolidWorks.Interop.cosworks
                 sb.AppendLine()
                 sb.AppendLine(String.Format("# ID={0} OD={1} N={2} H_pp={3} T={4} E={5} Nu={6} Density={7} Material={8}", _
                     profile.ID, profile.OD, profile.N, profile.H_pp, profile.T, profile.E, profile.Nu, profile.Density, profile.MaterialName))
+                ' Self-describing geometry labels (2026-08-21). EffPitch carries the
+                ' 2T fillet term so it varies with thickness; any angle label derived
+                ' from a fixed pitch drifts with T. TrueConnAngle is the inverse
+                ' natural-H angle at THIS run's pitch, which is what "angle" means.
+                Try
+                    Dim epNow As Double = profile.EffPitchPerRoll
+                    Dim angTrue As Double = Double.NaN
+                    If epNow > 0.0 Then
+                        angTrue = Math.Atan(Math.PI * profile.H_pp / (2.0 * epNow)) * 180.0 / Math.PI
+                    End If
+                    Dim rcNow As Double = profile.CrestRadius
+                    Dim rcTxt As String = "n/a"
+                    Dim trTxt As String = "n/a"
+                    If rcNow < 1.0E9 AndAlso rcNow > 0.0 Then
+                        rcTxt = String.Format("{0:F4}", rcNow)
+                        trTxt = String.Format("{0:F4}", profile.T / rcNow)
+                    End If
+                    sb.AppendLine(String.Format("# EffPitch={0:F4} TrueConnAngle={1:F3} HppOverEffPitch={2:F5} InputConnAngle={3:F2} R_crest={4} T_over_Rcrest={5}", _
+                        epNow, angTrue, profile.H_pp / epNow, profile.ConnectorAngle, rcTxt, trTxt))
+                Catch exLbl As Exception
+                    sb.AppendLine("# EffPitch=n/a TrueConnAngle=n/a (label computation failed: " & exLbl.Message & ")")
+                End Try
                 If profile.ProfileType = 11 Then
                     ' Self-describing DoubleRoll CenterFlat. effective = value actually
                     ' built after the span*0.8 clamp; distiller keys on effective.

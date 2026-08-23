@@ -41,6 +41,7 @@ Public Class BatchRow
     Public PitchTaperPct As Double = 0.0
     Public UseNaturalH As Boolean = False
     Public SolidMesh As Boolean = False    ' True = thin-wall solid + solid mesh (high-T recovery); False = shell
+    Public MeshScale As Double = 0.5       ' element-size multiplier on SW default (0.5 = campaign standard)
 
     ' ── Material ──
     Public MaterialName As String = "Rubber"
@@ -93,6 +94,7 @@ Public Class BatchRow
         p.PitchTaperPct = PitchTaperPct
         p.UseNaturalH = UseNaturalH
         p.SolidMesh = SolidMesh
+        p.MeshScale = MeshScale
         p.MaterialName = MaterialName
         p.E = E
         p.Nu = Nu
@@ -262,7 +264,7 @@ Public Class SweepMatrix
         "ConnAngle", "SLen", "CenterFlat", "BulletR_Top", "BulletCx", _
         "TaperPct", "VariablePitch", "PitchTaperPct", "UseNaturalH", _
         "Material", "E", "Nu", "Density", "MaxDisp", "Steps", "Direction", _
-        "OutputDir", "Message", "SolidMesh"}
+        "OutputDir", "Message", "SolidMesh", "MeshScale"}
 
     Public Shared Sub SaveCsv(ByVal rows As List(Of BatchRow), ByVal path As String)
         Dim sb As New StringBuilder()
@@ -281,7 +283,7 @@ Public Class SweepMatrix
                 CsvSafe(r.MaterialName), r.E.ToString(), r.Nu.ToString(), _
                 r.Density.ToString(), r.MaxDisp.ToString(), r.Steps.ToString(), _
                 r.Direction, CsvSafe(r.OutputDir), CsvSafe(r.Message), _
-                r.SolidMesh.ToString()}
+                r.SolidMesh.ToString(), r.MeshScale.ToString()}
             sb.AppendLine(String.Join(",", f))
         Next
         System.IO.File.WriteAllText(path, sb.ToString())
@@ -337,6 +339,8 @@ Public Class SweepMatrix
             r.OutputDir = GetS(f, ix, "OutputDir", "C:\SpiderSW_Results\Spider_Asymmetry")
             r.Message = GetS(f, ix, "Message", "")
             r.SolidMesh = GetB(f, ix, "SolidMesh", False)
+            r.MeshScale = GetD(f, ix, "MeshScale", 0.5)
+            If r.MeshScale <= 0.0 Then r.MeshScale = 0.5
             rows.Add(r)
         Next
         Return rows
