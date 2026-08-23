@@ -78,6 +78,9 @@ Imports System.Text
         ' shell mesh. 0.5 = campaign standard (finest). Larger = coarser.
         ' Explicit CSV column so mesh density can never live in prose again.
         Public MeshScale As Double = 0.5
+        ' Diagnostic-only bypass of the shell T/R_crest precheck. Rows run with
+        ' this True are quarantine-on-arrival and must never reach the store.
+        Public AllowHighTR As Boolean = False
 
         ' ── Geometry inputs ──
         Public ID As Double = 67.0

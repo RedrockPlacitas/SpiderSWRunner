@@ -173,8 +173,15 @@ Public Class BatchRunner
                 If rc > 0 AndAlso rc < Double.MaxValue Then
                     Dim tr As Double = p.T / rc
                     If tr > 0.13 AndAlso p.T > 0.43 Then
-                        r.PrecheckPass = False
-                        r.PrecheckNote = String.Format("T/R_crest {0:F3} > 0.13 at T={1:F2} (shell invalid at crest; solid-mesh needed) R_crest={2:F2}", tr, p.T, rc)
+                        If r.AllowHighTR Then
+                            ' Diagnostic bypass (2026-08-23). The row still runs, but it is
+                            ' quarantine-on-arrival: shell validity at the crest is NOT
+                            ' established here and the result must never reach the store.
+                            r.PrecheckNote = String.Format("*** QUARANTINE *** shell gate BYPASSED by AllowHighTR: T/R_crest {0:F3} > 0.13 at T={1:F2}, R_crest={2:F2}. Diagnostic only - DO NOT INGEST.", tr, p.T, rc)
+                        Else
+                            r.PrecheckPass = False
+                            r.PrecheckNote = String.Format("T/R_crest {0:F3} > 0.13 at T={1:F2} (shell invalid at crest; solid-mesh needed) R_crest={2:F2}", tr, p.T, rc)
+                        End If
                     End If
                 End If
             End If
