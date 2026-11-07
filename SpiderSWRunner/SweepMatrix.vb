@@ -43,6 +43,10 @@ Public Class BatchRow
     Public SolidMesh As Boolean = False    ' True = thin-wall solid + solid mesh (high-T recovery); False = shell
     Public MeshScale As Double = 0.5       ' element-size multiplier on SW default (0.5 = campaign standard)
     Public AllowHighTR As Boolean = False  ' True = bypass the shell T/R_crest precheck for this row (quarantine-only diagnostics)
+    ' INNER BOUNDARY CONDITION (2026-08-30). "free" = legacy: axial prescribed only, in-plane and
+    ' rotations free. "clamped" = bonded-cone: axial prescribed, in-plane held, rotations clamped.
+    ' Optional column; absent or blank = free, so every existing CSV is unchanged.
+    Public InnerBC As String = "free"
 
     ' ── Material ──
     Public MaterialName As String = "Rubber"
@@ -266,7 +270,7 @@ Public Class SweepMatrix
         "ConnAngle", "SLen", "CenterFlat", "BulletR_Top", "BulletCx", _
         "TaperPct", "VariablePitch", "PitchTaperPct", "UseNaturalH", _
         "Material", "E", "Nu", "Density", "MaxDisp", "Steps", "Direction", _
-        "OutputDir", "Message", "SolidMesh", "MeshScale", "AllowHighTR"}
+        "OutputDir", "Message", "SolidMesh", "MeshScale", "AllowHighTR", "InnerBC"}
 
     Public Shared Sub SaveCsv(ByVal rows As List(Of BatchRow), ByVal path As String)
         Dim sb As New StringBuilder()
@@ -285,7 +289,7 @@ Public Class SweepMatrix
                 CsvSafe(r.MaterialName), r.E.ToString(), r.Nu.ToString(), _
                 r.Density.ToString(), r.MaxDisp.ToString(), r.Steps.ToString(), _
                 r.Direction, CsvSafe(r.OutputDir), CsvSafe(r.Message), _
-                r.SolidMesh.ToString(), r.MeshScale.ToString(), r.AllowHighTR.ToString()}
+                r.SolidMesh.ToString(), r.MeshScale.ToString(), r.AllowHighTR.ToString(), r.InnerBC}
             sb.AppendLine(String.Join(",", f))
         Next
         System.IO.File.WriteAllText(path, sb.ToString())
@@ -344,6 +348,12 @@ Public Class SweepMatrix
             r.MeshScale = GetD(f, ix, "MeshScale", 0.5)
             If r.MeshScale <= 0.0 Then r.MeshScale = 0.5
             r.AllowHighTR = GetB(f, ix, "AllowHighTR", False)
+            r.InnerBC = GetS(f, ix, "InnerBC", "free").Trim().ToLowerInvariant()
+            If r.InnerBC = "" Then r.InnerBC = "free"
+            If r.InnerBC <> "free" AndAlso r.InnerBC <> "clamped" Then
+                r.Status = "FAIL"
+                r.Message = "InnerBC must be free or clamped, got '" & r.InnerBC & "'"
+            End If
             rows.Add(r)
         Next
         Return rows

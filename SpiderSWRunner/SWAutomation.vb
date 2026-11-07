@@ -24,6 +24,27 @@ Imports SolidWorks.Interop.cosworks
         Private _idEdge As Edge = Nothing
         Private _odEdge As Edge = Nothing
 
+        ' Persist the prescribed-displacement restraint so ProbeStudyConfiguration
+        ' can READ BACK what was actually applied. Setting a boundary condition and
+        ' logging the intent is not the same as confirming the study carries it;
+        ' 3000+ runs asserted this restraint and none ever verified it.
+        Private _dispRestraint As CWRestraint = Nothing
+        Private _dispRestraintLabel As String = ""
+
+        ' THIRD CONFIGURATION 2026-08-30. False = legacy: only axial translation
+        ' prescribed on the inner boundary, radial/circumferential and all
+        ' rotations free (flags 0,1,0; no rotation call). True = bonded-cone
+        ' condition: axial prescribed, in-plane translations held at zero,
+        ' all rotations clamped. Set per row by BatchRunner from the InnerBC
+        ' column before SetupStudy. Default False so every existing CSV runs
+        ' exactly as before.
+        Public InnerBoundaryClamped As Boolean = False
+
+        ' W_FREE GATE FLAG (2026-09-03). Set when the emitted W_free fails the
+        ' ActiveW check; BatchRunner reads it after each row and aborts the
+        ' remaining rows. Reset by BatchRunner before each row.
+        Public WFreeGateFailed As Boolean = False
+
         ' Persist solid-mesh state for CreateFinestMesh (which takes no profile).
         ' A thin-wall solid needs element size small vs the wall or it meshes zero.
         Private _solidMesh As Boolean = False
@@ -82,6 +103,18 @@ Imports SolidWorks.Interop.cosworks
                 Log("ERROR: Not connected.")
                 Return False
             End If
+            ' MESH-STATE FIX 2026-09-12. _meshScale / _solidMesh / _wallT were assigned
+            ' only inside the sketch-drawn geometry path, so TEMPLATE-path rows
+            ' (TriRadius, DoubleRoll) silently inherited whatever the previous
+            ' sketch-drawn row left behind. Latent since the template path was added;
+            ' first bit when the MS 0.25 scaling-band rows immediately preceded the
+            ' rubber TriRadius batch — 14 rows meshed at 0.25, ~63 min each. Assigned
+            ' here at entry, once, for every path. The duplicate assignment further
+            ' down the sketch path is left in place and is now redundant but harmless.
+            _solidMesh = profile.SolidMesh
+            _meshScale = profile.MeshScale
+            If _meshScale <= 0.0 Then _meshScale = 0.5
+            _wallT = profile.T
             ' Release all COM references before creating new part
             ' Prevents SW crash when user closes previous part manually
             Try
@@ -899,10 +932,44 @@ Imports SolidWorks.Interop.cosworks
                     Return False
                 End If
                 Dim sm As CWStudyManager = _cwDoc.StudyManager
-                _study = sm.GetStudy(sm.ActiveStudy)
+                If sm Is Nothing Then
+                    Log("ERROR: StudyManager is Nothing on reconnect.")
+                    Return False
+                End If
+                _study = Nothing
+                Try : _study = sm.GetStudy(sm.ActiveStudy) : Catch : _study = Nothing : End Try
                 If _study Is Nothing Then
                     Log("ERROR: Could not get active study.")
                     Return False
+                End If
+                ' Same defect class as SetupStudy: the ACTIVE study is not necessarily
+                ' ours. Confirm by name before handing this object to a mesh or a run.
+                Dim rcName As String = ""
+                Try : rcName = _study.Name : Catch : rcName = "" : End Try
+                If Not String.Equals(rcName, "SpiderNL", StringComparison.OrdinalIgnoreCase) Then
+                    Log(String.Format("  Active study is '{0}', not 'SpiderNL' — searching by name...", rcName))
+                    Dim rcFound As CWStudy = Nothing
+                    Dim rcCount As Integer = 0
+                    Try : rcCount = sm.StudyCount : Catch : rcCount = 0 : End Try
+                    For si As Integer = rcCount - 1 To 0 Step -1
+                        Dim cand As CWStudy = Nothing
+                        Try : cand = sm.GetStudy(si) : Catch : cand = Nothing : End Try
+                        If cand Is Nothing Then Continue For
+                        Dim cn As String = ""
+                        Try : cn = cand.Name : Catch : cn = "" : End Try
+                        If String.Equals(cn, "SpiderNL", StringComparison.OrdinalIgnoreCase) Then
+                            rcFound = cand
+                            Try : sm.ActiveStudy = si : Catch : End Try
+                            Exit For
+                        End If
+                    Next
+                    If rcFound Is Nothing Then
+                        Log("ERROR: no study named 'SpiderNL' to reconnect to.")
+                        _study = Nothing
+                        Return False
+                    End If
+                    _study = rcFound
+                    Log("  Reconnected to 'SpiderNL' by name.")
                 End If
                 Return True
             Catch ex As System.Exception
@@ -980,7 +1047,18 @@ Imports SolidWorks.Interop.cosworks
 
                     Dim diffId As Double = Math.Abs(rMean - rID_m)
                     If diffId < bestIdDiff Then bestIdDiff = diffId : idEdge = e : bestIdR = rMean
-                    If rMean > bestOdR Then odEdge = e : bestOdR = rMean
+                    ' BC STANDARD FIX 2026-09-03 (SD ruling: restraints at ID/2 and OD/2,
+                    ' lips are unloaded glue tabs). Previously the OD edge was picked as the
+                    ' OUTERMOST circular edge (If rMean > bestOdR), which on the DoubleRoll/
+                    ' N-Roll template selected the glue-tab rim at R = OD/2 + LipWidth + 5
+                    ' (111.5 on the gate frame) instead of the roll end at OD/2 (103.5).
+                    ' The target was logged and ignored. Now nearest-to-target, symmetric
+                    ' with the ID edge. Families whose outermost edge already sits at the
+                    ' target (HalfRoll, TriRadius, Flat v1's 106.5-vs-103.5 case aside)
+                    ' are unchanged; the W_free gate downstream stops any row where the
+                    ' bound still lands off-target.
+                    Dim diffOd As Double = Math.Abs(rMean - rOD_m)
+                    If diffOd < bestOdDiff Then bestOdDiff = diffOd : odEdge = e : bestOdR = rMean
                 Next
 
                 If idEdge IsNot Nothing Then
@@ -1011,7 +1089,42 @@ Imports SolidWorks.Interop.cosworks
                 _cw = Nothing
                 _cwDoc = Nothing
                 _study = Nothing
+                _dispRestraint = Nothing
+                _dispRestraintLabel = ""
                 If Not GetCosmosRetry(120) Then Return False
+
+                ' DOCUMENT HANDLE FIX 2026-08-30. _cw.ActiveDoc returns whatever
+                ' document SolidWorks currently considers active, which is NOT
+                ' necessarily the part this runner just built. Observed: a freshly
+                ' created part reported "StudyCount before create = 1" and
+                ' CreateNewStudy3 returned errCode 2 (name already in use), which a
+                ' brand-new part cannot produce. Setup was landing on a previously
+                ' open part that still carried a SpiderNL study, so material,
+                ' fixtures and restraints all applied to the wrong document while
+                ' each returned err=0, and the new part's Simulation tree stayed
+                ' empty. Force our own model active first.
+                Try
+                    Dim ourTitle As String = ""
+                    Try : ourTitle = _model.GetTitle() : Catch : End Try
+                    Dim actTitle As String = ""
+                    Try
+                        Dim actDoc As ModelDoc2 = DirectCast(_swApp.ActiveDoc, ModelDoc2)
+                        If actDoc IsNot Nothing Then actTitle = actDoc.GetTitle()
+                    Catch : End Try
+                    If Not String.Equals(ourTitle, actTitle, StringComparison.OrdinalIgnoreCase) Then
+                        Log(String.Format("  Active doc is '{0}' but our model is '{1}' — activating ours", actTitle, ourTitle))
+                        Dim actErr As Integer = 0
+                        Try : _swApp.ActivateDoc3(ourTitle, True, 0, actErr) : Catch : End Try
+                        Log(String.Format("  ActivateDoc3('{0}') err={1}", ourTitle, actErr))
+                        _cw = Nothing
+                        If Not GetCosmosRetry(120) Then Return False
+                    Else
+                        Log(String.Format("  Active doc confirmed: '{0}'", ourTitle))
+                    End If
+                Catch exAct As System.Exception
+                    Log("  WARNING: could not confirm active document: " & exAct.Message)
+                End Try
+
                 _cwDoc = _cw.ActiveDoc
                 If _cwDoc Is Nothing Then
                     Log("ERROR: Simulation has no active doc.")
@@ -1019,22 +1132,146 @@ Imports SolidWorks.Interop.cosworks
                 End If
 
                 ' ─── 3.1 Create study ───
+                ' DEFECT FIXED 2026-08-30. The previous version called
+                ' CreateNewStudy3, DISCARDED errCode, then took the LAST study in
+                ' the manager by index and logged "Study 'SpiderNL' created"
+                ' unconditionally. If the create failed, StudyCount was whatever it
+                ' already was, the code grabbed some other study (or a stale one),
+                ' and every downstream call — material, thickness, fixtures,
+                ' restraints, mesh — was applied to the wrong handle while each
+                ' returned its own err=0. The log reported a full successful setup
+                ' into an empty Simulation tree. Observed 2026-08-30: identical
+                ' symptom on both the current and the pre-change exe.
+                '
+                ' The log line is now written only after the study has been located
+                ' BY NAME and confirmed. "Study created" means created.
                 Log("Creating nonlinear study...")
                 Dim studyMgr As CWStudyManager = _cwDoc.StudyManager
-                Dim errCode As Integer = 0
-                studyMgr.CreateNewStudy3("SpiderNL", _
-                    CInt(swsAnalysisStudyType_e.swsAnalysisStudyTypeNonlinear), _
-                    0, errCode)
-                Dim cnt As Integer = studyMgr.StudyCount
-                If cnt > 0 Then
-                    studyMgr.ActiveStudy = cnt - 1
-                    _study = studyMgr.GetStudy(cnt - 1)
-                End If
-                If _study Is Nothing Then
-                    Log(String.Format("ERROR: Study creation failed (err={0})", errCode))
+                If studyMgr Is Nothing Then
+                    Log("ERROR: StudyManager is Nothing — Simulation not available on this document.")
                     Return False
                 End If
-                Log("Study 'SpiderNL' created")
+
+                Dim cntBefore As Integer = -1
+                Try : cntBefore = studyMgr.StudyCount : Catch : End Try
+                Log(String.Format("  StudyCount before create = {0}", cntBefore))
+
+                ' NAME-COLLISION FIX 2026-08-30. CreateNewStudy3 returned errCode 2
+                ' on this rig, which is the name-already-in-use condition: a study
+                ' called SpiderNL was already present on the document. The previous
+                ' code discarded errCode and adopted the stale study by index.
+                ' Remove any SpiderNL by name first so the create either succeeds
+                ' cleanly or fails for a reason that is not a leftover.
+                Try
+                    Dim stale As Boolean = False
+                    For si As Integer = 0 To cntBefore - 1
+                        Dim cand As CWStudy = Nothing
+                        Try : cand = studyMgr.GetStudy(si) : Catch : cand = Nothing : End Try
+                        If cand Is Nothing Then Continue For
+                        Dim cName As String = ""
+                        Try : cName = cand.Name : Catch : cName = "" : End Try
+                        Log(String.Format("    existing study [{0}] = '{1}'", si, cName))
+                        If String.Equals(cName, "SpiderNL", StringComparison.OrdinalIgnoreCase) Then stale = True
+                    Next
+                    If stale Then
+                        Try
+                            studyMgr.DeleteStudy("SpiderNL")
+                            Dim cntAfterDel As Integer = -1
+                            Try : cntAfterDel = studyMgr.StudyCount : Catch : End Try
+                            Log(String.Format("    deleted stale 'SpiderNL'; StudyCount now {0}", cntAfterDel))
+                            cntBefore = cntAfterDel
+                        Catch exDel As System.Exception
+                            Log("    ERROR deleting stale 'SpiderNL': " & exDel.Message)
+                        End Try
+                    End If
+                Catch exScan As System.Exception
+                    Log("    WARNING scanning existing studies: " & exScan.Message)
+                End Try
+
+                Dim errCode As Integer = 0
+                Dim newStudyObj As Object = Nothing
+                Try
+                    newStudyObj = studyMgr.CreateNewStudy3("SpiderNL", _
+                        CInt(swsAnalysisStudyType_e.swsAnalysisStudyTypeNonlinear), _
+                        0, errCode)
+                Catch exCS As System.Exception
+                    Log("ERROR: CreateNewStudy3 threw: " & exCS.Message)
+                    Return False
+                End Try
+                Log(String.Format("  CreateNewStudy3 errCode = {0}", errCode))
+                If errCode <> 0 Then
+                    Log("ERROR: study creation returned a non-zero error code. ABORTING this row.")
+                    Log("  Check that the SolidWorks Simulation add-in is loaded and the document is a valid Simulation doc.")
+                    Return False
+                End If
+
+                Dim cntAfter As Integer = -1
+                Try : cntAfter = studyMgr.StudyCount : Catch : End Try
+                Log(String.Format("  StudyCount after create  = {0}", cntAfter))
+                If cntAfter <= 0 Then
+                    Log("ERROR: StudyCount is zero after create — no study exists. ABORTING this row.")
+                    Return False
+                End If
+                If cntBefore >= 0 AndAlso cntAfter <> cntBefore + 1 Then
+                    Log(String.Format("  WARNING: StudyCount did not increase by 1 ({0} -> {1}). Locating by name.", cntBefore, cntAfter))
+                End If
+
+                ' Locate the study BY NAME. Never trust the last index: if the create
+                ' silently no-opped, the last index is a stale study from a previous
+                ' row and every subsequent call lands on the wrong object.
+                _study = Nothing
+                Dim foundIdx As Integer = -1
+                For si As Integer = cntAfter - 1 To 0 Step -1
+                    Dim cand As CWStudy = Nothing
+                    Try : cand = studyMgr.GetStudy(si) : Catch : cand = Nothing : End Try
+                    If cand Is Nothing Then Continue For
+                    Dim candName As String = ""
+                    Try : candName = cand.Name : Catch : candName = "" : End Try
+                    If String.Equals(candName, "SpiderNL", StringComparison.OrdinalIgnoreCase) Then
+                        _study = cand
+                        foundIdx = si
+                        Exit For
+                    End If
+                Next
+
+                If _study Is Nothing Then
+                    ' Fall back to the object CreateNewStudy3 handed back, if any,
+                    ' but only after saying plainly that the by-name lookup failed.
+                    Log("  WARNING: no study named 'SpiderNL' found in the manager.")
+                    If newStudyObj IsNot Nothing Then
+                        Try
+                            _study = DirectCast(newStudyObj, CWStudy)
+                            Log("  Using the study object returned by CreateNewStudy3 instead.")
+                        Catch
+                            _study = Nothing
+                        End Try
+                    End If
+                End If
+
+                If _study Is Nothing Then
+                    Log(String.Format("ERROR: Study creation failed (err={0}) — no usable study handle. ABORTING this row.", errCode))
+                    Return False
+                End If
+
+                ' Make it active, then CONFIRM the active study is the one we hold.
+                Try
+                    If foundIdx >= 0 Then studyMgr.ActiveStudy = foundIdx
+                Catch ex As System.Exception
+                    Log("  WARNING: could not set ActiveStudy: " & ex.Message)
+                End Try
+
+                Dim confirmName As String = ""
+                Try : confirmName = _study.Name : Catch : confirmName = "" : End Try
+                Dim confirmType As Integer = -1
+                Try : confirmType = _study.AnalysisType : Catch : confirmType = -1 : End Try
+                Log(String.Format("  Study handle: name='{0}'  index={1}  AnalysisType={2}", _
+                    confirmName, foundIdx, confirmType))
+                If Not String.Equals(confirmName, "SpiderNL", StringComparison.OrdinalIgnoreCase) Then
+                    Log("ERROR: the study handle is not 'SpiderNL'. Refusing to apply setup to the wrong study. ABORTING this row.")
+                    Return False
+                End If
+
+                Log("Study 'SpiderNL' created and verified")
 
                 ' ─── 3.2 Apply material ───
                 Log("")
@@ -1420,8 +1657,41 @@ Imports SolidWorks.Interop.cosworks
                                 ' manual 'Reverse direction' checkbox. Verify on first batch Pull
                                 ' run that Kms0 matches a prior manually-reversed Pull run.
                                 Dim dispSigned As Double = If(isPull, -disp_m, disp_m)
-                                dispR.SetTranslationComponentsValues(0, 1, 0, 0.0, dispSigned, 0.0)
+                                ' DIRECTION MAPPING WARNING — READ BEFORE CHANGING.
+                                ' Dir1/Dir2/Dir3 below are interpreted RELATIVE TO THE
+                                ' REFERENCE GEOMETRY selected above, and this mapping is
+                                ' valid ONLY for the Front Plane reference. Every run in
+                                ' the corpus to date has taken the Front Plane fallback
+                                ' (Axis1 resolved zero times in 3009 runs), for which
+                                ' Dir2 = Y = axial is correct.
+                                ' If the Axis1 lookup is ever made to succeed, the
+                                ' convention changes and Dir2 is NOT axial. Setting Dir2
+                                ' against an axis reference would prescribe a different
+                                ' degree of freedom and the run would produce a plausible
+                                ' force curve rather than an error. Do not "fix" the Axis1
+                                ' lookup without revisiting this mapping.
+                                ' ProbeStudyConfiguration logs GetCoordinateType() per run
+                                ' so the convention in force is recorded, not assumed.
+                                If InnerBoundaryClamped Then
+                                    ' Third configuration: axial prescribed, Dir1 and Dir3
+                                    ' held at zero (radial + circumferential on this
+                                    ' concentric full-360 boundary), all rotations clamped.
+                                    dispR.SetTranslationComponentsValues(1, 1, 1, 0.0, dispSigned, 0.0)
+                                    Try
+                                        dispR.SetRotationComponentsValues(1, 1, 1, 0.0, 0.0, 0.0)
+                                        Log("  Inner boundary: CLAMPED — translation flags (1,1,1), rotation flags (1,1,1) all zero")
+                                    Catch exRot As System.Exception
+                                        Log("  *** Inner boundary: rotation clamp FAILED: " & exRot.Message & " ***")
+                                        Log("  *** Configuration is radially restrained but rotationally FREE — not the intended third configuration. FAILING setup. ***")
+                                        Return False
+                                    End Try
+                                Else
+                                    dispR.SetTranslationComponentsValues(0, 1, 0, 0.0, dispSigned, 0.0)
+                                    Log("  Inner boundary: FREE (legacy) — translation flags (0,1,0), no rotation call")
+                                End If
                                 Dim endErr As Integer = dispR.RestraintEndEdit()
+                                _dispRestraint = dispR
+                                _dispRestraintLabel = dispLabel & If(InnerBoundaryClamped, " [CLAMPED]", " [FREE]")
                                 Log(String.Format("  Prescribed disp: {0}mm Dir2=Y axial {1} (err={2})", _
                                     maxDisp_mm, If(isPull, "PULL(-Y)", "PUSH(+Y)"), endErr))
                             Catch ex2 As System.Exception
@@ -1458,6 +1728,60 @@ Imports SolidWorks.Interop.cosworks
                         Catch ex2 As System.Exception
                             Log("  UseLargeDisplacement failed: " & ex2.Message)
                         End Try
+
+                        ' LARGE STRAIN FOR HYPERELASTIC ROWS (2026-09-07, SD standing rule:
+                        ' "set to 1 on hyperelastic rows when the MR gates come off hold and
+                        ' verify on read-back — not an investigation, a setting").
+                        ' Selected by the material-name convention already load-bearing in
+                        ' this runner: a name ending _MR is the Mooney-Rivlin card. Inert
+                        ' for every linear material — cloth/foam rows are byte-identical in
+                        ' behaviour. Read back immediately; a hyperelastic row whose
+                        ' read-back is not 1 FAILS here rather than solving small-strain
+                        ' and reporting success.
+                        If profile.MaterialName IsNot Nothing AndAlso _
+                           profile.MaterialName.Trim().ToUpperInvariant().EndsWith("_MR") Then
+                            Dim lsOK As Boolean = False
+                            Try
+                                opts.UseLargeStrain = 1
+                                Dim rb As Integer = -1
+                                Try : rb = CInt(opts.UseLargeStrain) : Catch : rb = -1 : End Try
+                                lsOK = (rb = 1)
+                                Log("  UseLargeStrain = 1 requested; read-back = " & rb.ToString() & If(lsOK, "   *** VERIFIED ***", ""))
+                            Catch exLS As System.Exception
+                                Log("  UseLargeStrain set failed: " & exLS.Message)
+                            End Try
+                            If Not lsOK Then
+                                Log("  *** HYPERELASTIC ROW WITHOUT LARGE STRAIN: read-back != 1. FAILING setup. ***")
+                                Return False
+                            End If
+
+                            ' MR CONVERGENCE TIGHTENING (2026-09-09, SD probe P2 / ruling
+                            ' pending its result). On _MR rows only: convTol 0.001 -> 0.0001
+                            ' and maxEquilIter 20 -> 50, via SetStepToleranceOptions with the
+                            ' other three values passed through from a read-back so nothing
+                            ' else moves. Read back and logged; failure to apply FAILS the
+                            ' row rather than solving at an unknown tolerance. Linear rows
+                            ' untouched. If SD's decision tree rules against this branch,
+                            ' this block is the rollback delta.
+                            Try
+                                Dim nEq As Integer, nMaxEq As Integer
+                                Dim dConv As Double, dPlast As Double, dSing As Double
+                                opts.GetStepToleranceOptions(nEq, nMaxEq, dConv, dPlast, dSing)
+                                Dim rc As Integer = opts.SetStepToleranceOptions(nEq, 50, 0.0001, dPlast, dSing)
+                                Dim nEq2 As Integer, nMaxEq2 As Integer
+                                Dim dConv2 As Double, dPlast2 As Double, dSing2 As Double
+                                opts.GetStepToleranceOptions(nEq2, nMaxEq2, dConv2, dPlast2, dSing2)
+                                Log(String.Format("  MR tolerance: convTol {0:G6} -> {1:G6}, maxEquilIter {2} -> {3} (rc={4})   *** READ BACK ***", _
+                                    dConv, dConv2, nMaxEq, nMaxEq2, rc))
+                                If Math.Abs(dConv2 - 0.0001) > 0.000001 OrElse nMaxEq2 <> 50 Then
+                                    Log("  *** MR tolerance did not take on read-back. FAILING setup. ***")
+                                    Return False
+                                End If
+                            Catch exTol As System.Exception
+                                Log("  *** MR tolerance set failed: " & exTol.Message & ". FAILING setup. ***")
+                                Return False
+                            End Try
+                        End If
 
                         Try
                             opts.EndTime = 1.0
@@ -1530,6 +1854,12 @@ Imports SolidWorks.Interop.cosworks
                 Catch ex As System.Exception
                     Log("  Properties failed: " & ex.Message)
                 End Try
+
+                ' Read-only configuration probe. Records what the study ACTUALLY
+                ' carries rather than what was intended. Never mutates state; every
+                ' read is individually guarded so a missing property on any SW build
+                ' logs a line and cannot fail the run.
+                ProbeStudyConfiguration()
 
                 Log("")
                 Log("=== Setup complete ===")
@@ -1808,6 +2138,860 @@ Imports SolidWorks.Interop.cosworks
         End Sub
 
         ' ──────────────────────────────────────────────────────────────
+        ' PROFILE EXTRACT MODE (2026-09-01, default flipped to 1).
+        ' 0 = legacy per-node, 1 = bulk per-step, 2 = both + bit-for-bit diff.
+        ' DEFAULT IS 1 — BULK. Flipped per SD's ruling after the acceptance
+        ' condition was met: 36 consecutive extractions (4 flat truth-case rows
+        ' + all 32 G9 Tri-Radius rows on rolled geometry, clamped boundary,
+        ' truncated and complete legs alike) each compared legacy against bulk
+        ' on every profile node at every excursion level, ~5900 values per row,
+        ' 23,640 values across G9 alone, ZERO differences. Verdict lines are in
+        ' SpiderSW_debug.log, "ACCEPTANCE VERDICT: BIT-FOR-BIT IDENTICAL".
+        ' The legacy path remains in the build; the optional file
+        ' C:\SpiderSW_Results\extract_mode.txt overrides (0 = legacy,
+        ' 2 = both + diff) and the path checked is logged either way.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function ReadExtractMode() As Integer
+            Dim p As String = "C:\SpiderSW_Results\extract_mode.txt"
+            Try
+                If Not System.IO.File.Exists(p) Then
+                    Log("  extract_mode.txt not present at " & p & " — default mode 1 (bulk)")
+                    Return 1
+                End If
+                Dim s As String = System.IO.File.ReadAllText(p).Trim()
+                Dim m As Integer = 0
+                If Integer.TryParse(s, m) AndAlso m >= 0 AndAlso m <= 2 Then
+                    Log("  extract_mode.txt = " & m)
+                    Return m
+                End If
+                Log("  extract_mode.txt present but unparseable ('" & s & "') — default mode 1 (bulk)")
+                Return 1
+            Catch ex As System.Exception
+                Log("  extract_mode.txt read error (" & ex.Message & ") — default mode 1 (bulk)")
+                Return 1
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' SHELL-FACE STRESS READOUT (2026-09-26, SD finding + Patrick's
+        ' ruling: stress must be accurate, no one-face readout).
+        ' The three calls the runner used until now —
+        '   GetStressForEntities2(bValueByNode, NComponent, NStepNumber, DispPlane,
+        '                         Entities, NUnits, ErrorCode)
+        '   GetStressComponentForAllStepsAtNode(NComponent, NNodeNum, DispPlane,
+        '                         NUnits, ErrorCode)
+        '   GetMinMaxStress(NComponent, NElementNumber, NStepNum, DispPlane,
+        '                         NUnits, ErrorCode)
+        ' carry NO shell-face argument (SimAPI_Members.txt, interop 22.4.0.54).
+        ' Whatever face they return is Simulation's default. The SW2014 interop
+        ' does carry
+        '   GetStressForEntities3(bValueByNode, NComponent, NStepNumber, DispPlane,
+        '                         Entities, NUnits, nShellFace, nPlyNumber,
+        '                         bInPlyDirection, ErrorCode)
+        ' with an explicit nShellFace. This block reads TOP and BOTTOM through
+        ' that call, per node, per step, and writes both plus their max.
+        '   C:\SpiderSW_Results\stress_faces.txt : 0 = legacy one-face readout
+        '     (reproduces old files; NOT for landing), 1 = face-resolved readout
+        '     (default when the file is absent), 2 = face-resolved + FACE PROOF:
+        '     the legacy calls are made as well and compared node by node; the
+        '     comparison is written to <stem>_faceproof.txt. Any failure of the
+        '     face-resolved calls FAILS the run — nothing is written silently.
+        '   C:\SpiderSW_Results\keep_study_open.txt : if present, the runner does
+        '     not close the part / exit SolidWorks at shutdown, so the solved study
+        '     can be plotted in the GUI (top vs bottom face) as a second witness.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function ReadStressFaceMode() As Integer
+            Dim p As String = "C:\SpiderSW_Results\stress_faces.txt"
+            Try
+                If Not System.IO.File.Exists(p) Then
+                    Log("  stress_faces.txt not present at " & p & " — default mode 1 (face-resolved TOP/BOTTOM)")
+                    Return 1
+                End If
+                Dim s As String = System.IO.File.ReadAllText(p).Trim()
+                Dim m As Integer = 0
+                If Integer.TryParse(s, m) AndAlso m >= 0 AndAlso m <= 2 Then
+                    Log("  stress_faces.txt = " & m & "  (0=legacy one-face, 1=face-resolved, 2=face-resolved + FACE PROOF)")
+                    Return m
+                End If
+                ' SD 21:3x MDT 09-26: a present-but-invalid value must FAIL the row, never default.
+                Log("  *** stress_faces.txt present but not 0, 1 or 2 ('" & s & "') — no default taken; the row FAILS ***")
+                Return -1
+            Catch ex As System.Exception
+                Log("  *** stress_faces.txt read error (" & ex.Message & ") — no default taken; the row FAILS ***")
+                Return -1
+            End Try
+        End Function
+
+        Public Function KeepStudyOpenRequested() As Boolean
+            Try
+                Return System.IO.File.Exists("C:\SpiderSW_Results\keep_study_open.txt")
+            Catch
+                Return False
+            End Try
+        End Function
+
+        ' Resolve the swsShellFace_e codes for Top and Bottom from the interop
+        ' assembly metadata — never hard-coded. Logs every member of the enum.
+        Private Function ResolveShellFaceCodes(ByRef topCode As Integer, ByRef botCode As Integer, _
+                                               ByRef enumDesc As String) As Boolean
+            topCode = -1 : botCode = -1 : enumDesc = ""
+            Try
+                Dim asmCos As System.Reflection.Assembly = GetType(CWStudy).Assembly
+                Dim found As Type = Nothing
+                For Each t As Type In asmCos.GetTypes()
+                    If t.IsEnum AndAlso t.Name.ToLower().Contains("shellface") Then
+                        found = t : Exit For
+                    End If
+                Next
+                If found Is Nothing Then
+                    Log("  FACE: no enum named *ShellFace* in " & asmCos.GetName().Name & " — cannot resolve face codes")
+                    Return False
+                End If
+                Dim names() As String = [Enum].GetNames(found)
+                Dim vals As Array = [Enum].GetValues(found)
+                Dim sbE As New StringBuilder()
+                sbE.Append(found.Name & " {")
+                For i As Integer = 0 To names.Length - 1
+                    Dim v As Integer = Convert.ToInt32(vals.GetValue(i))
+                    If i > 0 Then sbE.Append(", ")
+                    sbE.Append(names(i) & "=" & v)
+                    Dim nl As String = names(i).ToLower()
+                    If nl.Contains("top") AndAlso topCode < 0 Then topCode = v
+                    If nl.Contains("bottom") AndAlso botCode < 0 Then botCode = v
+                Next
+                sbE.Append("}")
+                enumDesc = sbE.ToString()
+                Log("  FACE: " & enumDesc)
+                If topCode < 0 OrElse botCode < 0 Then
+                    Log("  FACE: could not identify Top/Bottom members by name — cannot resolve face codes")
+                    Return False
+                End If
+                Log(String.Format("  FACE: top={0} bottom={1}", topCode, botCode))
+                Return True
+            Catch ex As System.Exception
+                Log("  FACE: enum reflection failed: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' Entity set = every face of the first sheet body (same rule as the
+        ' bulk profile path).
+        Private Function GetShellEntityArray(ByRef eArr() As Object) As Boolean
+            eArr = Nothing
+            Try
+                Dim faceObjs As New List(Of Object)()
+                Dim part As PartDoc = DirectCast(_model, PartDoc)
+                Dim bodies As Object = part.GetBodies2(CInt(swBodyType_e.swSheetBody), True)
+                If bodies Is Nothing Then bodies = part.GetBodies2(CInt(swBodyType_e.swSolidBody), True)
+                If bodies IsNot Nothing Then
+                    Dim bodyArr() As Object = DirectCast(bodies, Object())
+                    If bodyArr.Length > 0 Then
+                        Dim body As Body2 = DirectCast(bodyArr(0), Body2)
+                        Dim faces As Object = body.GetFaces()
+                        If faces IsNot Nothing Then
+                            For Each fObj As Object In DirectCast(faces, Object())
+                                faceObjs.Add(fObj)
+                            Next
+                        End If
+                    End If
+                End If
+                If faceObjs.Count = 0 Then
+                    Log("  FACE: no faces found on the body — cannot form the entity set")
+                    Return False
+                End If
+                eArr = faceObjs.ToArray()
+                Return True
+            Catch ex As System.Exception
+                Log("  FACE: face enumeration failed: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' One face-resolved von Mises read over the whole shell at one step.
+        ' Returns [nodeID, Pa] pairs in dict form. False on any error.
+        Private Function FaceStressAtStep(ByVal results As CWResults, ByVal eArr() As Object, _
+                                          ByVal stepNum As Integer, ByVal faceCode As Integer, _
+                                          ByVal plyArg As Integer, ByRef vals As Dictionary(Of Integer, Double), _
+                                          ByRef why As String) As Boolean
+            vals = Nothing : why = ""
+            Try
+                Dim st As Integer = 0
+                Dim o As Object = results.GetStressForEntities3(True, 9, stepNum, Nothing, eArr, 0, faceCode, plyArg, False, st)
+                If st <> 0 Then why = "ErrorCode=" & st : Return False
+                If o Is Nothing Then why = "returned Nothing" : Return False
+                Dim oa() As Object = DirectCast(o, Object())
+                If oa.Length = 0 OrElse (oa.Length Mod 2) <> 0 Then why = "unexpected array length " & oa.Length : Return False
+                vals = New Dictionary(Of Integer, Double)(oa.Length \ 2)
+                For i As Integer = 0 To oa.Length - 1 Step 2
+                    vals(CInt(oa(i))) = CDbl(oa(i + 1))
+                Next
+                Return True
+            Catch ex As System.Exception
+                why = ex.Message
+                Return False
+            End Try
+        End Function
+
+        ' Face-resolved extraction over all steps.
+        '   maxAll/maxTop/maxBot(step)  : per-step maxima over every node, MPa
+        '   maxNode(step)               : node carrying maxAll
+        '   topByStep/botByStep         : per-node values (MPa) kept only for the
+        '                                 decile steps (keys = 0-based step index)
+        ' proofMode: also make the legacy calls at the decile steps and at every
+        ' step for GetMinMaxStress, compare, and write <stem>_faceproof.txt.
+        Private Function FaceStressExtract(ByVal results As CWResults, ByVal stepCount As Integer, _
+                                           ByVal proofMode As Boolean, ByVal nodeR As Dictionary(Of Integer, Double), _
+                                           ByVal nodeY As Dictionary(Of Integer, Double), ByVal proofPath As String, _
+                                           ByRef maxAll() As Double, ByRef maxTop() As Double, ByRef maxBot() As Double, _
+                                           ByRef maxNode() As Integer, _
+                                           ByRef topByStep As Dictionary(Of Integer, Dictionary(Of Integer, Double)), _
+                                           ByRef botByStep As Dictionary(Of Integer, Dictionary(Of Integer, Double)), _
+                                           ByRef provenance As String) As Boolean
+            provenance = ""
+            Try
+                Dim topCode As Integer = -1, botCode As Integer = -1, enumDesc As String = ""
+                If Not ResolveShellFaceCodes(topCode, botCode, enumDesc) Then Return False
+                Dim eArr() As Object = Nothing
+                If Not GetShellEntityArray(eArr) Then Return False
+                Log(String.Format("  FACE: entity set = {0} face(s)", eArr.Length))
+
+                ' Ply argument: this is a single-layer shell, not a composite. Try 0,
+                ' then 1, at step 1 on the TOP face; the one that answers is used for
+                ' every call and recorded in the provenance line. Neither -> fail.
+                Dim plyArg As Integer = -1
+                Dim probe As Dictionary(Of Integer, Double) = Nothing
+                Dim why As String = ""
+                For Each cand As Integer In New Integer() {0, 1}
+                    If FaceStressAtStep(results, eArr, 1, topCode, cand, probe, why) Then
+                        plyArg = cand : Exit For
+                    Else
+                        Log(String.Format("  FACE: nPlyNumber={0} rejected at step 1 ({1})", cand, why))
+                    End If
+                Next
+                If plyArg < 0 Then
+                    Log("  FACE: GetStressForEntities3 answered for no ply argument — FAILING (no one-face fallback)")
+                    Return False
+                End If
+                Log(String.Format("  FACE: nPlyNumber={0} accepted; step 1 TOP returned {1} nodes", plyArg, probe.Count))
+
+                ' decile steps (same formula as the profile writer)
+                Dim decile As New HashSet(Of Integer)()
+                Dim fracs() As Double = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}
+                For Each fr As Double In fracs
+                    Dim s As Integer = CInt(Math.Round(fr * (stepCount - 1)))
+                    If s < 0 Then s = 0
+                    If s >= stepCount Then s = stepCount - 1
+                    decile.Add(s)
+                Next
+
+                ReDim maxAll(stepCount - 1) : ReDim maxTop(stepCount - 1) : ReDim maxBot(stepCount - 1)
+                ReDim maxNode(stepCount - 1)
+                topByStep = New Dictionary(Of Integer, Dictionary(Of Integer, Double))()
+                botByStep = New Dictionary(Of Integer, Dictionary(Of Integer, Double))()
+
+                ' proof accumulators
+                Dim sbP As New StringBuilder()
+                Dim nMinMaxEqTop As Integer = 0, nMinMaxEqBot As Integer = 0, nMinMaxEqMax As Integer = 0, nMinMaxOther As Integer = 0
+                Dim maxMinMaxRelToBest As Double = 0.0
+                Dim legEqTop As Integer = 0, legEqBot As Integer = 0, legNeither As Integer = 0, legCmp As Integer = 0
+                Dim legMaxDTop As Double = 0.0, legMaxDBot As Double = 0.0
+                Dim sampleLines As New List(Of String)()
+                If proofMode Then
+                    sbP.AppendLine("FACE PROOF — legacy calls vs face-resolved GetStressForEntities3")
+                    sbP.AppendLine("Generated: " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))
+                    sbP.AppendLine("Enum: " & enumDesc)
+                    sbP.AppendLine(String.Format("Codes used: top={0} bottom={1} nPlyNumber={2} bInPlyDirection=False NUnits=0 (Pa; /1e6 -> MPa)", topCode, botCode, plyArg))
+                    sbP.AppendLine("")
+                    sbP.AppendLine("A. Per step: GetMinMaxStress(9,-1,step,Nothing,0) max value vs max over nodes of TOP and BOTTOM")
+                    sbP.AppendLine("step,minmax_MPa,maxTop_MPa,maxBot_MPa,minmax_equals")
+                End If
+
+                Dim t0 As DateTime = DateTime.Now
+                Dim reportEvery As Integer = Math.Max(1, stepCount \ 10)
+                For iStep As Integer = 0 To stepCount - 1
+                    Dim stepNum As Integer = iStep + 1
+                    Dim top As Dictionary(Of Integer, Double) = Nothing
+                    Dim bot As Dictionary(Of Integer, Double) = Nothing
+                    If Not FaceStressAtStep(results, eArr, stepNum, topCode, plyArg, top, why) Then
+                        Log(String.Format("  FACE: TOP read failed at step {0}: {1} — FAILING", stepNum, why)) : Return False
+                    End If
+                    If Not FaceStressAtStep(results, eArr, stepNum, botCode, plyArg, bot, why) Then
+                        Log(String.Format("  FACE: BOTTOM read failed at step {0}: {1} — FAILING", stepNum, why)) : Return False
+                    End If
+                    If top.Count <> bot.Count Then
+                        Log(String.Format("  FACE: step {0} TOP returned {1} nodes, BOTTOM {2} — FAILING", stepNum, top.Count, bot.Count)) : Return False
+                    End If
+                    Dim mA As Double = Double.NegativeInfinity, mT As Double = Double.NegativeInfinity, mB As Double = Double.NegativeInfinity
+                    Dim mNode As Integer = -1
+                    For Each kv As KeyValuePair(Of Integer, Double) In top
+                        Dim vT As Double = kv.Value
+                        Dim vB As Double = 0.0
+                        If Not bot.TryGetValue(kv.Key, vB) Then
+                            Log(String.Format("  FACE: step {0} node {1} present on TOP, absent on BOTTOM — FAILING", stepNum, kv.Key)) : Return False
+                        End If
+                        If vT > mT Then mT = vT
+                        If vB > mB Then mB = vB
+                        Dim vM As Double = Math.Max(vT, vB)
+                        If vM > mA Then mA = vM : mNode = kv.Key
+                    Next
+                    maxAll(iStep) = mA / 1000000.0
+                    maxTop(iStep) = mT / 1000000.0
+                    maxBot(iStep) = mB / 1000000.0
+                    maxNode(iStep) = mNode
+                    If decile.Contains(iStep) Then
+                        Dim tM As New Dictionary(Of Integer, Double)(top.Count)
+                        Dim bM As New Dictionary(Of Integer, Double)(bot.Count)
+                        For Each kv As KeyValuePair(Of Integer, Double) In top
+                            tM(kv.Key) = kv.Value / 1000000.0
+                            bM(kv.Key) = bot(kv.Key) / 1000000.0
+                        Next
+                        topByStep(iStep) = tM
+                        botByStep(iStep) = bM
+                    End If
+
+                    If proofMode Then
+                        ' A. GetMinMaxStress at this step
+                        Try
+                            Dim sx As Integer = 0
+                            Dim oa() As Object = DirectCast(results.GetMinMaxStress(9, -1, stepNum, Nothing, 0, sx), Object())
+                            Dim mm As Double = CDbl(oa(3)) / 1000000.0
+                            Dim tag As String = "OTHER"
+                            If mm = maxTop(iStep) AndAlso mm = maxBot(iStep) Then
+                                tag = "BOTH" : nMinMaxEqMax += 1
+                            ElseIf mm = maxTop(iStep) Then
+                                tag = "TOP" : nMinMaxEqTop += 1
+                            ElseIf mm = maxBot(iStep) Then
+                                tag = "BOTTOM" : nMinMaxEqBot += 1
+                            Else
+                                nMinMaxOther += 1
+                                Dim best As Double = Math.Min(Math.Abs(mm - maxTop(iStep)), Math.Abs(mm - maxBot(iStep)))
+                                Dim rel As Double = best / Math.Max(1.0E-12, Math.Abs(mm))
+                                If rel > maxMinMaxRelToBest Then maxMinMaxRelToBest = rel
+                            End If
+                            sbP.AppendLine(String.Format("{0},{1:F6},{2:F6},{3:F6},{4}", stepNum, mm, maxTop(iStep), maxBot(iStep), tag))
+                        Catch exM As System.Exception
+                            sbP.AppendLine(String.Format("{0},ERR,{1:F6},{2:F6},({3})", stepNum, maxTop(iStep), maxBot(iStep), exM.Message))
+                        End Try
+                        ' B. legacy GetStressForEntities2 at the decile steps, node by node
+                        If decile.Contains(iStep) Then
+                            Try
+                                Dim st2 As Integer = 0
+                                Dim oa2() As Object = DirectCast(results.GetStressForEntities2(True, 9, stepNum, Nothing, eArr, 0, st2), Object())
+                                Dim nT As Integer = 0, nB As Integer = 0, nN As Integer = 0
+                                Dim dT As Double = 0.0, dB As Double = 0.0
+                                For i As Integer = 0 To oa2.Length - 1 Step 2
+                                    Dim nid As Integer = CInt(oa2(i))
+                                    Dim vL As Double = CDbl(oa2(i + 1))
+                                    Dim vT As Double = 0.0, vB As Double = 0.0
+                                    If top.TryGetValue(nid, vT) AndAlso bot.TryGetValue(nid, vB) Then
+                                        legCmp += 1
+                                        If vL = vT Then
+                                            nT += 1
+                                        ElseIf vL = vB Then
+                                            nB += 1
+                                        Else
+                                            nN += 1
+                                        End If
+                                        If Math.Abs(vL - vT) > dT Then dT = Math.Abs(vL - vT)
+                                        If Math.Abs(vL - vB) > dB Then dB = Math.Abs(vL - vB)
+                                    End If
+                                Next
+                                legEqTop += nT : legEqBot += nB : legNeither += nN
+                                If dT / 1000000.0 > legMaxDTop Then legMaxDTop = dT / 1000000.0
+                                If dB / 1000000.0 > legMaxDBot Then legMaxDBot = dB / 1000000.0
+                                sampleLines.Add(String.Format("step {0}: legacy==TOP {1}, legacy==BOTTOM {2}, neither {3}, max|leg-top| {4:F6} MPa, max|leg-bot| {5:F6} MPa", _
+                                    stepNum, nT, nB, nN, dT / 1000000.0, dB / 1000000.0))
+                                ' sample rows at the last step: 8 nodes spread over R
+                                If iStep = stepCount - 1 Then
+                                    Dim ids As New List(Of Integer)(top.Keys)
+                                    ids.Sort(Function(a, b) nodeR(a).CompareTo(nodeR(b)))
+                                    Dim stepN As Integer = Math.Max(1, ids.Count \ 8)
+                                    Dim legDict As New Dictionary(Of Integer, Double)()
+                                    For i As Integer = 0 To oa2.Length - 1 Step 2
+                                        legDict(CInt(oa2(i))) = CDbl(oa2(i + 1))
+                                    Next
+                                    sampleLines.Add(String.Format("sample nodes at step {0} (nid, R_mm, Z_mm, legacy_MPa, top_MPa, bottom_MPa):", stepNum))
+                                    For i As Integer = 0 To ids.Count - 1 Step stepN
+                                        Dim nid As Integer = ids(i)
+                                        Dim vL As Double = 0.0
+                                        legDict.TryGetValue(nid, vL)
+                                        sampleLines.Add(String.Format("  {0},{1:F3},{2:F3},{3:F6},{4:F6},{5:F6}", nid, nodeR(nid), nodeY(nid), vL / 1000000.0, top(nid) / 1000000.0, bot(nid) / 1000000.0))
+                                    Next
+                                End If
+                            Catch exL As System.Exception
+                                sampleLines.Add(String.Format("step {0}: legacy GetStressForEntities2 failed: {1}", stepNum, exL.Message))
+                            End Try
+                        End If
+                    End If
+
+                    If ((iStep + 1) Mod reportEvery = 0) OrElse (iStep = stepCount - 1) Then
+                        Log(String.Format("    FACE: {0}/{1} steps  elapsed {2:F1}s", iStep + 1, stepCount, (DateTime.Now - t0).TotalSeconds))
+                        System.Windows.Forms.Application.DoEvents()
+                    End If
+                Next
+                Log(String.Format("  FACE: done in {0:F1}s — laststep maxTop={1:F4} maxBot={2:F4} max={3:F4} MPa @ node {4}", _
+                    (DateTime.Now - t0).TotalSeconds, maxTop(stepCount - 1), maxBot(stepCount - 1), maxAll(stepCount - 1), maxNode(stepCount - 1)))
+                provenance = String.Format("TOP and BOTTOM shell faces via GetStressForEntities3 ({0}; top={1} bottom={2} nPlyNumber={3})", _
+                    enumDesc, topCode, botCode, plyArg)
+
+                If proofMode Then
+                    sbP.AppendLine("")
+                    sbP.AppendLine(String.Format("A summary over {0} steps: GetMinMaxStress == maxTop on {1}, == maxBot on {2}, == both on {3}, neither on {4} (worst rel. gap to nearer face {5:E2})", _
+                        stepCount, nMinMaxEqTop, nMinMaxEqBot, nMinMaxEqMax, nMinMaxOther, maxMinMaxRelToBest))
+                    sbP.AppendLine("")
+                    sbP.AppendLine("B. Legacy GetStressForEntities2 (no face argument) vs TOP / BOTTOM, node by node, at the decile steps")
+                    For Each ln As String In sampleLines
+                        sbP.AppendLine(ln)
+                    Next
+                    sbP.AppendLine("")
+                    sbP.AppendLine(String.Format("B summary: {0} node-steps compared; legacy == TOP exactly on {1}, == BOTTOM exactly on {2}, neither on {3}; max|legacy-top| {4:F6} MPa, max|legacy-bottom| {5:F6} MPa", _
+                        legCmp, legEqTop, legEqBot, legNeither, legMaxDTop, legMaxDBot))
+                    Dim verdict As String = "UNDECIDED"
+                    If legCmp > 0 AndAlso legEqTop = legCmp Then
+                        verdict = "LEGACY READOUT = TOP FACE on every node and step"
+                    ElseIf legCmp > 0 AndAlso legEqBot = legCmp Then
+                        verdict = "LEGACY READOUT = BOTTOM FACE on every node and step"
+                    ElseIf legCmp > 0 AndAlso legNeither = 0 Then
+                        verdict = "LEGACY READOUT = a per-node MIX of top and bottom (each value equals one face, not always the same one)"
+                    ElseIf legCmp > 0 Then
+                        verdict = "LEGACY READOUT MATCHES NEITHER FACE on some nodes (see B lines) — not a face selection; investigate before landing stress"
+                    End If
+                    sbP.AppendLine("VERDICT: " & verdict)
+                    Log("  FACE PROOF VERDICT: " & verdict)
+                    Try
+                        System.IO.File.WriteAllText(proofPath, sbP.ToString())
+                        Log("  Face proof: " & proofPath)
+                    Catch exW As System.Exception
+                        Log("  Face proof write failed: " & exW.Message)
+                    End Try
+                End If
+                Return True
+            Catch ex As System.Exception
+                Log("  FACE: extraction error: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' BULK PROFILE EXTRACT (2026-08-30).
+        ' One call per excursion step per component over the whole shell face
+        ' set, instead of one call per node returning every step. The
+        ' displacement call is GetDisplacementForEntities, which this runner
+        ' already uses (and already decodes as [nodeID, value] pairs) for the
+        ' ID-edge reaction audit. Stress uses GetStressForEntities2 with
+        ' bValueByNode=True; its pair layout is confirmed at runtime by checking
+        ' that the returned node IDs are ones we know. Any layout doubt -> the
+        ' function reports failure rather than guessing.
+        ' Units and component numbers are identical to the legacy path:
+        ' displacement comp 0 = UX, 1 = UY, NUnits 0; stress comp 9 = von Mises,
+        ' NUnits 0, divided by 1e6 to MPa.
+        ' Fills out(pi, ti) for ti = 1..10 using profileSteps(ti) as the
+        ' 0-based step index; API step numbers are 1-based.
+        ' ──────────────────────────────────────────────────────────────
+        Private Function BulkProfileExtract(ByVal results As CWResults, _
+                                            ByVal profileNodes As List(Of Integer), _
+                                            ByVal profileSteps() As Integer, _
+                                            ByVal wantStress As Boolean, _
+                                            ByRef outUX(,) As Double, _
+                                            ByRef outUY(,) As Double, _
+                                            ByRef outS(,) As Double, _
+                                            ByRef stressOK As Boolean) As Boolean
+            stressOK = False
+            Try
+                ' entity set = every face of the first sheet body (the shell)
+                Dim faceObjs As New List(Of Object)()
+                Try
+                    Dim part As PartDoc = DirectCast(_model, PartDoc)
+                    Dim bodies As Object = part.GetBodies2(CInt(swBodyType_e.swSheetBody), True)
+                    If bodies Is Nothing Then bodies = part.GetBodies2(CInt(swBodyType_e.swSolidBody), True)
+                    If bodies IsNot Nothing Then
+                        Dim bodyArr() As Object = DirectCast(bodies, Object())
+                        If bodyArr.Length > 0 Then
+                            Dim body As Body2 = DirectCast(bodyArr(0), Body2)
+                            Dim faces As Object = body.GetFaces()
+                            If faces IsNot Nothing Then
+                                For Each fObj As Object In DirectCast(faces, Object())
+                                    faceObjs.Add(fObj)
+                                Next
+                            End If
+                        End If
+                    End If
+                Catch ex As System.Exception
+                    Log("  Bulk: face enumeration failed: " & ex.Message)
+                End Try
+                If faceObjs.Count = 0 Then
+                    Log("  Bulk: no faces found on the body — cannot form the entity set")
+                    Return False
+                End If
+                Dim eArr() As Object = faceObjs.ToArray()
+                Log(String.Format("  Bulk: entity set = {0} face(s)", eArr.Length))
+
+                ' index profile nodes for O(1) lookup
+                Dim want As New Dictionary(Of Integer, Integer)()
+                For pi As Integer = 0 To profileNodes.Count - 1
+                    want(profileNodes(pi)) = pi
+                Next
+
+                Dim dispCalls As Integer = 0
+                Dim stressCalls As Integer = 0
+                Dim stressFails As Integer = 0
+
+                For ti As Integer = 1 To 10
+                    Dim stepNum As Integer = profileSteps(ti) + 1   ' API is 1-based
+                    ' --- UX ---
+                    Dim hitX As Integer = 0
+                    Try
+                        Dim st As Integer = 0
+                        Dim oa() As Object = DirectCast(results.GetDisplacementForEntities(0, stepNum, Nothing, eArr, 0, st), Object())
+                        dispCalls += 1
+                        If oa Is Nothing OrElse (oa.Length Mod 2) <> 0 Then
+                            Log(String.Format("  Bulk: UX step {0} returned unexpected array (len={1})", stepNum, If(oa Is Nothing, -1, oa.Length)))
+                            Return False
+                        End If
+                        For i As Integer = 0 To oa.Length - 1 Step 2
+                            Dim nid As Integer = CInt(oa(i))
+                            Dim pi As Integer = 0
+                            If want.TryGetValue(nid, pi) Then
+                                outUX(pi, ti) = CDbl(oa(i + 1)) : hitX += 1
+                            End If
+                        Next
+                    Catch ex As System.Exception
+                        Log(String.Format("  Bulk: UX step {0} failed: {1}", stepNum, ex.Message))
+                        Return False
+                    End Try
+                    ' --- UY ---
+                    Dim hitY As Integer = 0
+                    Try
+                        Dim st As Integer = 0
+                        Dim oa() As Object = DirectCast(results.GetDisplacementForEntities(1, stepNum, Nothing, eArr, 0, st), Object())
+                        dispCalls += 1
+                        If oa Is Nothing OrElse (oa.Length Mod 2) <> 0 Then
+                            Log(String.Format("  Bulk: UY step {0} returned unexpected array (len={1})", stepNum, If(oa Is Nothing, -1, oa.Length)))
+                            Return False
+                        End If
+                        For i As Integer = 0 To oa.Length - 1 Step 2
+                            Dim nid As Integer = CInt(oa(i))
+                            Dim pi As Integer = 0
+                            If want.TryGetValue(nid, pi) Then
+                                outUY(pi, ti) = CDbl(oa(i + 1)) : hitY += 1
+                            End If
+                        Next
+                    Catch ex As System.Exception
+                        Log(String.Format("  Bulk: UY step {0} failed: {1}", stepNum, ex.Message))
+                        Return False
+                    End Try
+                    If hitX <> profileNodes.Count OrElse hitY <> profileNodes.Count Then
+                        Log(String.Format("  Bulk: step {0} covered {1}/{3} nodes (UX) and {2}/{3} (UY) — incomplete, failing", stepNum, hitX, hitY, profileNodes.Count))
+                        Return False
+                    End If
+                    ' --- von Mises, by node ---
+                    If wantStress Then
+                        Try
+                            Dim st As Integer = 0
+                            Dim oa() As Object = DirectCast(results.GetStressForEntities2(True, 9, stepNum, Nothing, eArr, 0, st), Object())
+                            stressCalls += 1
+                            Dim hitS As Integer = 0
+                            If oa IsNot Nothing AndAlso (oa.Length Mod 2) = 0 Then
+                                For i As Integer = 0 To oa.Length - 1 Step 2
+                                    Dim nid As Integer = CInt(oa(i))
+                                    Dim pi As Integer = 0
+                                    If want.TryGetValue(nid, pi) Then
+                                        outS(pi, ti) = CDbl(oa(i + 1)) / 1000000.0 : hitS += 1
+                                    End If
+                                Next
+                            End If
+                            If hitS <> profileNodes.Count Then
+                                stressFails += 1
+                                Log(String.Format("  Bulk: stress step {0} covered {1}/{2} nodes — layout not the expected [nodeID,value] pairs", stepNum, hitS, profileNodes.Count))
+                            End If
+                        Catch ex As System.Exception
+                            stressFails += 1
+                            Log(String.Format("  Bulk: stress step {0} failed: {1}", stepNum, ex.Message))
+                        End Try
+                    End If
+                    System.Windows.Forms.Application.DoEvents()
+                Next
+                stressOK = wantStress AndAlso (stressFails = 0)
+                Log(String.Format("  Bulk: {0} displacement calls, {1} stress calls, {2} stress failures", dispCalls, stressCalls, stressFails))
+                Return True
+            Catch ex As System.Exception
+                Log("  Bulk profile extract error: " & ex.Message)
+                Return False
+            End Try
+        End Function
+
+        ' ──────────────────────────────────────────────────────────────
+        ' DIAGNOSTIC — STUDY CONFIGURATION PROBE. READ-ONLY.
+        '
+        ' Records what the study ACTUALLY carries. Every value below was
+        ' previously either set-without-readback or never touched at all,
+        ' so the configuration of 3000+ corpus runs rests on intent rather
+        ' than on evidence. Member names are taken verbatim from the SW2014
+        ' interop dump (C:\SpiderSW_Results\SimAPI_Members.txt), sections
+        ' ICWStudy / ICWNonLinearStudyOptions / ICWShell / ICWRestraint /
+        ' ICWMaterial.
+        '
+        ' Specifically closes:
+        '   AnalysisType            nonlinear vs linear, read back not assumed
+        '   UseLargeDisplacement    geometric nonlinearity, READ BACK
+        '   UseLargeStrain          a SEPARATE flag, never set, never logged
+        '   step tolerance options  convergence tol, iteration limits — never set
+        '   Solver/Control/Iterative/Integration method — never set
+        '   shell Formulation       thin vs thick — never set
+        '   ShellOffsetOption/Value shell mid-surface offset — never set
+        '   restraint read-back     translation AND rotation components applied
+        '   GetCoordinateType       which direction convention is in force
+        '   contact set count       self-contact is expected to be zero
+        '
+        ' Read-only contract: no property is written and no edit bracket is
+        ' opened. Every read is individually guarded so an absent member on
+        ' any SW build logs a line and can never fail a run.
+        ' ──────────────────────────────────────────────────────────────
+        Public Sub ProbeStudyConfiguration()
+            Try
+                If _study Is Nothing Then Return
+                Log("========================================")
+                Log("  STUDY CONFIGURATION PROBE (read-only)")
+                Log("========================================")
+
+                Try : Log("  Study name            = '" & _study.Name & "'") : Catch ex As System.Exception
+                    Log("  Study name            read failed: " & ex.Message)
+                End Try
+                Try : Log("  AnalysisType          = " & _study.AnalysisType.ToString() & "  (nonlinear expected)")
+                Catch ex As System.Exception
+                    Log("  AnalysisType          read failed: " & ex.Message)
+                End Try
+                Try : Log("  MeshType              = " & _study.MeshType.ToString())
+                Catch ex As System.Exception
+                    Log("  MeshType              read failed: " & ex.Message)
+                End Try
+
+                ' ---- Nonlinear study options ----
+                Try
+                    Dim o As CWNonLinearStudyOptions = _study.NonLinearStudyOptions
+                    If o Is Nothing Then
+                        Log("  NonLinearStudyOptions = Nothing")
+                    Else
+                        Try : Log("  UseLargeDisplacement  = " & o.UseLargeDisplacement.ToString() & "   *** READ BACK ***")
+                        Catch ex As System.Exception
+                            Log("  UseLargeDisplacement  read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  UseLargeStrain        = " & o.UseLargeStrain.ToString() & "   *** never set by runner ***")
+                        Catch ex As System.Exception
+                            Log("  UseLargeStrain        read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  UseUpdateLoadDirection= " & o.UseUpdateLoadDirection.ToString())
+                        Catch ex As System.Exception
+                            Log("  UseUpdateLoadDirection read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  SolverType            = " & o.SolverType.ToString())
+                        Catch ex As System.Exception
+                            Log("  SolverType            read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  ControlMethodType     = " & o.ControlMethodType.ToString() & "   (arc-length candidate)")
+                        Catch ex As System.Exception
+                            Log("  ControlMethodType     read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  IterativeMethodType   = " & o.IterativeMethodType.ToString())
+                        Catch ex As System.Exception
+                            Log("  IterativeMethodType   read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  IntegrationMethodType = " & o.IntegrationMethodType.ToString())
+                        Catch ex As System.Exception
+                            Log("  IntegrationMethodType read failed: " & ex.Message)
+                        End Try
+                        Try : Log("  TimeIncrement         = " & o.TimeIncrement.ToString() & "  (1 = Fixed)")
+                        Catch : End Try
+                        Try : Log(String.Format("  FixedTimeIncrement    = {0:G6}", o.FixedTimeIncrement))
+                        Catch : End Try
+                        Try : Log(String.Format("  StartTime / EndTime   = {0:G6} / {1:G6}", o.StartTime, o.EndTime))
+                        Catch : End Try
+                        Try
+                            Dim nEq As Integer = 0
+                            Dim nMaxEq As Integer = 0
+                            Dim dConv As Double = 0.0
+                            Dim dPlast As Double = 0.0
+                            Dim dSing As Double = 0.0
+                            o.GetStepToleranceOptions(nEq, nMaxEq, dConv, dPlast, dSing)
+                            Log(String.Format("  StepTolerance: equilIter={0} maxEquilIter={1} convTol={2:G6} plasticityTol={3:G6} singularityFactor={4:G6}", _
+                                nEq, nMaxEq, dConv, dPlast, dSing))
+                        Catch ex As System.Exception
+                            Log("  GetStepToleranceOptions read failed: " & ex.Message)
+                        End Try
+                    End If
+                Catch ex As System.Exception
+                    Log("  NonLinearStudyOptions read failed: " & ex.Message)
+                End Try
+
+                ' ---- Shell formulation and offset ----
+                Try
+                    Dim shellMgr As CWShellManager = _study.ShellManager
+                    If shellMgr Is Nothing OrElse shellMgr.ShellCount = 0 Then
+                        Log("  Shells                = none")
+                    Else
+                        For si As Integer = 0 To shellMgr.ShellCount - 1
+                            Dim shErr As Integer = 0
+                            Dim sh As CWShell = shellMgr.GetShellAt(si, shErr)
+                            If sh Is Nothing Then
+                                Log(String.Format("  Shell {0}: GetShellAt returned Nothing", si))
+                                Continue For
+                            End If
+                            Try : Log(String.Format("  Shell {0} Formulation      = {1}   *** never set by runner (thin vs thick) ***", si, sh.Formulation))
+                            Catch ex As System.Exception
+                                Log(String.Format("  Shell {0} Formulation      read failed: {1}", si, ex.Message))
+                            End Try
+                            Try : Log(String.Format("  Shell {0} ShellOffsetOption = {1}   *** never set by runner ***", si, sh.ShellOffsetOption))
+                            Catch ex As System.Exception
+                                Log(String.Format("  Shell {0} ShellOffsetOption read failed: {1}", si, ex.Message))
+                            End Try
+                            Try : Log(String.Format("  Shell {0} ShellOffsetValue  = {1:G6}", si, sh.ShellOffsetValue))
+                            Catch ex As System.Exception
+                                Log(String.Format("  Shell {0} ShellOffsetValue  read failed: {1}", si, ex.Message))
+                            End Try
+                            Try : Log(String.Format("  Shell {0} ShellThickness    = {1:G6}  unit={2}", si, sh.ShellThickness, sh.ShellUnit))
+                            Catch : End Try
+                            ' Material term counts. NoOfBulkModuli / NoOfShearModuli are
+                            ' most likely Prony-series counts for viscoelasticity rather
+                            ' than a Mooney-Rivlin volumetric term, so a zero here does
+                            ' NOT prove the card carries no bulk field. Logged because it
+                            ' is more evidence than the fixed six-name lookup gives.
+                            Try
+                                Dim mat As CWMaterial = sh.GetShellMaterial()
+                                If mat IsNot Nothing Then
+                                    Try : Log(String.Format("  Shell {0} material         = '{1}'  ModelType={2}", si, mat.MaterialName, mat.ModelType))
+                                    Catch : End Try
+                                    Try : Log(String.Format("  Shell {0} MooneyRivlinConstants={1}  OgdenConstants={2}", si, mat.MooneyRivlinConstants, mat.OgdenConstants))
+                                    Catch : End Try
+                                    Try : Log(String.Format("  Shell {0} NoOfShearModuli={1}  NoOfBulkModuli={2}", si, mat.NoOfShearModuli, mat.NoOfBulkModuli))
+                                    Catch ex As System.Exception
+                                        Log(String.Format("  Shell {0} modulus counts read failed: {1}", si, ex.Message))
+                                    End Try
+                                End If
+                            Catch ex As System.Exception
+                                Log(String.Format("  Shell {0} GetShellMaterial failed: {1}", si, ex.Message))
+                            End Try
+                        Next
+                    End If
+                Catch ex As System.Exception
+                    Log("  ShellManager read failed: " & ex.Message)
+                End Try
+
+                ' ---- Prescribed-displacement restraint, READ BACK ----
+                If _dispRestraint Is Nothing Then
+                    Log("  Restraint read-back   = no handle (restraint was not created this run)")
+                Else
+                    Try : Log("  Restraint entity      = " & _dispRestraintLabel)
+                    Catch : End Try
+                    Try : Log("  Restraint type        = " & _dispRestraint.RestraintType.ToString())
+                    Catch ex As System.Exception
+                        Log("  RestraintType         read failed: " & ex.Message)
+                    End Try
+                    Try : Log("  CoordinateType        = " & _dispRestraint.GetCoordinateType().ToString() & "   (direction convention in force)")
+                    Catch ex As System.Exception
+                        Log("  GetCoordinateType     read failed: " & ex.Message)
+                    End Try
+                    Try
+                        Dim b1 As Integer = 0
+                        Dim b2 As Integer = 0
+                        Dim b3 As Integer = 0
+                        Dim d1 As Double = 0.0
+                        Dim d2 As Double = 0.0
+                        Dim d3 As Double = 0.0
+                        _dispRestraint.GetTranslationComponentsValues(b1, b2, b3, d1, d2, d3)
+                        Log(String.Format("  Translation applied   flags=({0},{1},{2})  values=({3:G6},{4:G6},{5:G6})", b1, b2, b3, d1, d2, d3))
+                        If b1 = 0 AndAlso b3 = 0 Then
+                            Log("    -> Dir1 and Dir3 INACTIVE: boundary is free in-plane (radially free)")
+                        End If
+                    Catch ex As System.Exception
+                        Log("  GetTranslationComponentsValues read failed: " & ex.Message)
+                    End Try
+                    Try
+                        Dim r1 As Integer = 0
+                        Dim r2 As Integer = 0
+                        Dim r3 As Integer = 0
+                        Dim e1 As Double = 0.0
+                        Dim e2 As Double = 0.0
+                        Dim e3 As Double = 0.0
+                        _dispRestraint.GetRotationComponentsValues(r1, r2, r3, e1, e2, e3)
+                        Log(String.Format("  Rotation applied      flags=({0},{1},{2})  values=({3:G6},{4:G6},{5:G6})", r1, r2, r3, e1, e2, e3))
+                        If r1 = 0 AndAlso r2 = 0 AndAlso r3 = 0 Then
+                            Log("    -> all rotation components INACTIVE: boundary is rotationally free")
+                        End If
+                    Catch ex As System.Exception
+                        Log("  GetRotationComponentsValues read failed: " & ex.Message)
+                    End Try
+                End If
+
+                ' ---- Contact ----
+                Try
+                    Dim cm As Object = _study.ContactManager
+                    If cm Is Nothing Then
+                        Log("  ContactManager        = Nothing")
+                    Else
+                        Dim cCount As Object = Nothing
+                        Try : cCount = CallByName(cm, "ContactCount", CallType.Get) : Catch : End Try
+                        If cCount Is Nothing Then
+                            Try : cCount = CallByName(cm, "Count", CallType.Get) : Catch : End Try
+                        End If
+                        If cCount Is Nothing Then
+                            Log("  Contact sets          = count property not found on this build")
+                        Else
+                            Log("  Contact sets          = " & cCount.ToString() & "   (0 expected: self-contact is OFF)")
+                        End If
+                    End If
+                Catch ex As System.Exception
+                    Log("  ContactManager read failed: " & ex.Message)
+                End Try
+
+                Log("========================================")
+                Log("  STUDY CONFIGURATION PROBE COMPLETE")
+                Log("========================================")
+            Catch ex As System.Exception
+                Log("STUDY CONFIGURATION PROBE ERROR: " & ex.Message)
+            End Try
+        End Sub
+
+        ' ──────────────────────────────────────────────────────────────
+        ' DIAGNOSTIC — MESH QUALITY PROBE. READ-ONLY.
+        ' Worst Jacobian ratio, max aspect ratio and mesh-failure state are
+        ' all available on ICWMesh and none has ever been read. They are
+        ' load-bearing for the G5 mesh-convergence pair, where a shape shift
+        ' between MeshScale 0.5 and 0.25 has to be attributable to refinement
+        ' rather than to a degenerate element in one of the two meshes.
+        ' ──────────────────────────────────────────────────────────────
+        Public Sub ProbeMeshQuality()
+            Try
+                If _study Is Nothing Then Return
+                Dim mesh As CWMesh = _study.Mesh
+                If mesh Is Nothing Then
+                    Log("  MESH QUALITY: no CWMesh object")
+                    Return
+                End If
+                Log("  ── mesh quality (read-only) ──")
+                Try : Log(String.Format("    IsMeshFailed        = {0}", mesh.IsMeshFailed))
+                Catch ex As System.Exception
+                    Log("    IsMeshFailed        read failed: " & ex.Message)
+                End Try
+                Try : Log(String.Format("    WorstJacobianRatio  = {0:G6}", mesh.GetWorstJacobianRatio()))
+                Catch ex As System.Exception
+                    Log("    GetWorstJacobianRatio read failed: " & ex.Message)
+                End Try
+                Try : Log(String.Format("    MaxAspectRatio      = {0:G6}", mesh.MaxAspectRatio))
+                Catch ex As System.Exception
+                    Log("    MaxAspectRatio      read failed: " & ex.Message)
+                End Try
+                Try : Log(String.Format("    UseJacobianCheckForShells = {0}", mesh.UseJacobianCheckForShells))
+                Catch : End Try
+                Try : Log(String.Format("    ElementSize / Tolerance   = {0:G6} / {1:G6}", mesh.ElementSize, mesh.Tolerance))
+                Catch : End Try
+                Try : Log(String.Format("    Quality / MesherType      = {0} / {1}", mesh.Quality, mesh.MesherType))
+                Catch : End Try
+            Catch ex As System.Exception
+                Log("  MESH QUALITY PROBE ERROR: " & ex.Message)
+            End Try
+        End Sub
+
+        ' ──────────────────────────────────────────────────────────────
         ' DIAGNOSTIC — Probe the ACTIVE study's shell material state.
         ' Read-only; changes nothing. Intended use: run Setup, manually
         ' select Hyperelastic - Mooney Rivlin in the study material
@@ -2029,6 +3213,7 @@ Imports SolidWorks.Interop.cosworks
                         Log(String.Format("  Mesh: {0} nodes, {1} elements", _
                             mesh.NodeCount, mesh.ElementCount))
                     Catch : End Try
+                    ProbeMeshQuality()
                     Return (meshErr = 0)
                 Catch ex As System.Exception
                     Log("  CreateMesh failed: " & ex.Message)
@@ -2140,6 +3325,12 @@ Imports SolidWorks.Interop.cosworks
         End Function
 
         Public Sub ShutdownSolidWorks()
+            ' keep_study_open.txt (2026-09-26): leave the solved part and SolidWorks
+            ' open so the study can be plotted in the GUI (face proof, check 1).
+            If KeepStudyOpenRequested() Then
+                Log("keep_study_open.txt present — NOT closing the part or SolidWorks; study left open for GUI inspection")
+                Return
+            End If
             ' Release COM references first.
             Try
                 _study = Nothing : _cwDoc = Nothing : _cw = Nothing
@@ -2585,6 +3776,7 @@ Imports SolidWorks.Interop.cosworks
                     ' pushing through the instability. Partial results are saved
                     ' by the solver and the validator flags the early stop.
                     StartDialogWatchdog()
+                    Dim wdBefore As Integer = _watchdogDismissals
                     Dim runErr As Integer = 0
                     Try
                         runErr = _study.RunAnalysis()
@@ -2600,17 +3792,59 @@ Imports SolidWorks.Interop.cosworks
                         End While
                         StopDialogWatchdog()
                     End Try
-                    Log(String.Format("RunAnalysis complete (err={0}){1}", _
-                        runErr, If(_watchdogDismissals > 0, _
-                        String.Format("  [watchdog dismissed {0} solver dialog(s) — likely buckling/limit point]", _watchdogDismissals), "")))
+                    ' ANNOTATION FIXED 2026-08-30. This line previously printed the
+                    ' CUMULATIVE _watchdogDismissals counter as though it were a
+                    ' per-run count, and asserted "likely buckling/limit point" with
+                    ' no evidence. One observed dialog on this rig read "Error: This
+                    ' model is not sufficiently restrained", which is a fatal setup
+                    ' error, not a limit point. Print the DELTA and state nothing
+                    ' about cause.
+                    Dim wdThisRun As Integer = _watchdogDismissals - wdBefore
+                    Log(String.Format("RunAnalysis returned err={0}{1}", _
+                        runErr, If(wdThisRun > 0, _
+                        String.Format("  [watchdog dismissed {0} dialog(s) this run; cause unknown — see watchdog.log for titles]", wdThisRun), "")))
                     If runErr <> 0 Then
-                        Log("WARNING: err<>0 (often the buckling stop itself — check the response).")
+                        Log("WARNING: err<>0.")
                     End If
-                    ' err<>0 with watchdog dismissals is the buckling case: the
-                    ' run is still 'successful' for extraction (partial data
-                    ' exists). Return True so the pipeline extracts; the CSV
-                    ' validator decides PASS vs PARTIAL from the step count.
-                    Return (runErr = 0 OrElse _watchdogDismissals > 0)
+
+                    ' RESULTS CHECK ADDED 2026-08-30. err=0 is NOT evidence that a
+                    ' solve happened. Observed: a study whose setup had been applied
+                    ' to the wrong handle returned err=0 from RunAnalysis with no
+                    ' results at all, and the runner reported success and proceeded
+                    ' to extraction before failing there. Confirm a result set exists
+                    ' HERE, where the failure can still be attributed to the solve.
+                    Dim haveResults As Boolean = False
+                    Try
+                        Dim res As CWResults = _study.Results
+                        If res IsNot Nothing Then
+                            Dim nSteps As Integer = -1
+                            Try : nSteps = res.GetMaximumAvailableSteps() : Catch : nSteps = -1 : End Try
+                            If nSteps > 0 Then
+                                haveResults = True
+                                Log(String.Format("  Results present: {0} step(s) available.", nSteps))
+                            Else
+                                ' Some builds do not expose a step count; a non-Nothing
+                                ' Results object is then the only signal available.
+                                haveResults = True
+                                Log("  Results object present (step count not readable on this build).")
+                            End If
+                        Else
+                            Log("  Results object is Nothing.")
+                        End If
+                    Catch exR As System.Exception
+                        Log("  Results check failed: " & exR.Message)
+                    End Try
+
+                    If Not haveResults Then
+                        Log("ERROR: the solve produced NO RESULTS. err=" & runErr.ToString() & " is not evidence a solve ran.")
+                        Log("  Check the Simulation study tree: if Fixtures is empty, the setup was applied to a different study.")
+                        Return False
+                    End If
+
+                    ' A run that produced results is extractable even if err<>0 —
+                    ' the buckling stop leaves partial data and the CSV validator
+                    ' decides PASS vs PARTIAL from the step count.
+                    Return True
                 Catch ex As System.Exception
                     StopDialogWatchdog()
                     Log("RunAnalysis failed: " & ex.Message)
@@ -3027,6 +4261,75 @@ Imports SolidWorks.Interop.cosworks
                                 Dim wFree As Double = rODmin - rIDmax
                                 Log(String.Format("  W_FREE: ID bound R {0:F3}..{1:F3} mm | OD bound R {2:F3}..{3:F3} mm | W_free = {4:F3} mm | 0.55*W_free = {5:F3} mm", _
                                     rIDmin, rIDmax, rODmin, rODmax, wFree, 0.55 * wFree))
+                                ' W_FREE GATE 2026-09-03, SD ruling verbatim: "Emitted W_free
+                                ' must equal ActiveW = (OD-ID)/2 or the row stops." Encoded as
+                                ' a machine gate so a mis-bound family cannot spend a night:
+                                ' the row FAILS and BatchRunner reads WFreeGateFailed and
+                                ' aborts the remaining rows. Tolerance 0.01mm.
+                                ' BETA-5 SPAN LAW (2026-09-15). Replaces both the ID/2 basis
+                                ' and the per-frame constant, each of which rejected parts
+                                ' that reproduced the archive exactly. Derived from the
+                                ' archive and VERIFIED against 709 of 711 corrugated spider
+                                ' runs on file: the inner glue flange projects 2 x T
+                                ' radially (not its lip width, not a constant), the outer
+                                ' lip takes its full width, so
+                                '     span = (OD/2 - OuterLip) - (ID/2 + 2*T)
+                                ' Predicts 45.300 at T 1.10, 46.500 at T 0.50, 47.220 at
+                                ' T 0.14 - every value the machine has emitted on 67/172.
+                                ' The 2 exceptions are one OD-115-frame cell whose outer
+                                ' face sits 0.135mm off; tolerance 0.15mm covers it without
+                                ' admitting a real geometry error (a lip or natH mismatch
+                                ' moves the span by 1.9mm or more).
+                                ' FLAT parts (ProfileType 13) have no corrugation and bind
+                                ' at the bare edges: span = OD/2 + OuterLip - ID/2. Gated
+                                ' separately.
+                                ' Edge (mode 1) is unchanged and still gates on ActiveW.
+                                Dim gateW As Double = wFree
+                                Dim activeW As Double = (profile.OD - profile.ID) / 2.0
+                                Dim spanTol As Double = 0.01
+                                If profile.ComponentMode = 1 AndAlso profile.ProfileType = 13 Then
+                                    ' EDGE FLAT BRANCH (2026-09-26, queue #7 / stress check 3). An edge
+                                    ' Flat is one planar ring whose restraints route to its bare edges
+                                    ' (see the single-face ring handling in SetupStudy), so the clamped
+                                    ' span is the whole disk: (OD/2 + LipWidth) - (ID/2 - InnerLipWidth)
+                                    ' = 37.500 at 148/207 with lips 3/5. Gating that against (OD-ID)/2
+                                    ' failed every edge Flat row. Same 0.01 mm tolerance.
+                                    activeW = (profile.OD / 2.0 + profile.LipWidth) - (profile.ID / 2.0 - profile.InnerLipWidth)
+                                    Log(String.Format("  EDGE SPAN (flat): measured {0:F3} mm vs clamped-disk span {1:F3} mm [(OD/2+{2:F2}) - (ID/2-{3:F2})]", _
+                                        wFree, activeW, profile.LipWidth, profile.InnerLipWidth))
+                                End If
+                                If profile.ComponentMode = 0 Then
+                                    spanTol = 0.15
+                                    If profile.ProfileType = 13 Then
+                                        activeW = (profile.OD / 2.0 + profile.LipWidth) - profile.ID / 2.0
+                                        Log(String.Format("  SPIDER SPAN (flat): measured {0:F3} mm vs law {1:F3} mm | 0.55*law = {2:F3} mm", _
+                                            wFree, activeW, 0.55 * activeW))
+                                    ElseIf profile.ProfileType = 0 AndAlso profile.InnerLipWidth <= 0.0 Then
+                                        ' PURE SINE, NO INNER FLANGE (2026-09-26). A Sin profile with
+                                        ' InnerLipWidth 0 starts its corrugation at ID/2 and binds on
+                                        ' the bare ID edge: the 2T flange projection does not exist.
+                                        ' Verified on the 125 banked Campaign_Spider_Clamped_Beta5
+                                        ' reaction files (09-14): all 57 Sin rows emit ID/2..OD/2
+                                        ' (52.500 at 67/172); all 68 SineLines rows emit ID/2+2T
+                                        ' (the 09-15 law) and stay on the law below. The 09-15 law
+                                        ' rejected the first Sin re-run at |d| = 2.200 mm.
+                                        activeW = (profile.OD / 2.0 - profile.LipWidth) - profile.ID / 2.0
+                                        Log(String.Format("  SPIDER SPAN (Sin, no inner flange): measured {0:F3} mm vs law {1:F3} mm [(OD/2-{2:F1}) - ID/2] | 0.55*law = {3:F3} mm", _
+                                            wFree, activeW, profile.LipWidth, 0.55 * activeW))
+                                    Else
+                                        activeW = (profile.OD / 2.0 - profile.LipWidth) - (profile.ID / 2.0 + 2.0 * profile.T)
+                                        Log(String.Format("  SPIDER SPAN (law): measured {0:F3} mm vs law {1:F3} mm [(OD/2-{2:F1}) - (ID/2+2*{3:F2})] | 0.55*law = {4:F3} mm", _
+                                            wFree, activeW, profile.LipWidth, profile.T, 0.55 * activeW))
+                                    End If
+                                End If
+                                If Math.Abs(gateW - activeW) > spanTol Then
+                                    WFreeGateFailed = True
+                                    Log(String.Format("  *** W_FREE GATE: emitted {0:F3} != expected {1:F3} (|d|={2:F3}mm). ROW FAILED; batch will abort. ***", _
+                                        gateW, activeW, Math.Abs(gateW - activeW)))
+                                    Log("  *** Per SD's standard ruling this row's family binds off-standard;")
+                                    Log("  *** report the bounds above to SD. ***")
+                                    Return False
+                                End If
                             End If
                             ' Binding classification, recorded per run rather than inferred
                             ' from family. InvRoll cloth at H_pp 18 bound to the EDGE where
@@ -3060,19 +4363,58 @@ Imports SolidWorks.Interop.cosworks
                     Log("  REACTION AUDIT failed: " & exA.Message)
                 End Try
 
-                ' ─── Phase 4.5: Tier 3 via GetMinMaxStress (one call per step) ───────
-                ' Fast path: ~50 calls total. <1 second on a 10k-node mesh.
-                Log("  Phase 4.5: GetMinMaxStress per step (Tier 3)...")
+                ' ─── Phase 4.5: per-step global von Mises max ───────────────────────
+                ' stress_faces.txt mode 1/2 (default): TOP and BOTTOM faces read
+                ' explicitly via GetStressForEntities3 at every step; the _auto
+                ' columns carry the max over both faces plus each face's max.
+                ' Mode 0: the legacy GetMinMaxStress path below (face unspecified).
+                Dim stressFaceMode As Integer = ReadStressFaceMode()
+                If stressFaceMode < 0 Then
+                    Log("  *** stress_faces.txt invalid — FAILING run (values: absent or 1 = face-resolved, 0 = legacy, 2 = proof) ***")
+                    Return False
+                End If
                 Dim stressOK As Boolean = False
                 Dim vmMax(stepCount - 1) As Double
                 Dim vmMaxR(stepCount - 1) As Double
                 Dim vmMaxZ(stepCount - 1) As Double
                 Dim vmMaxNodeID(stepCount - 1) As Integer
+                Dim vmMaxTop() As Double = Nothing
+                Dim vmMaxBot() As Double = Nothing
+                Dim faceTopByStep As Dictionary(Of Integer, Dictionary(Of Integer, Double)) = Nothing
+                Dim faceBotByStep As Dictionary(Of Integer, Dictionary(Of Integer, Double)) = Nothing
+                Dim faceProvenance As String = ""
+                Dim faceResolved As Boolean = False
+
+                If stressFaceMode >= 1 Then
+                    Log(String.Format("  Phase 4.5: face-resolved von Mises, {0} steps x 2 faces{1}...", stepCount, If(stressFaceMode = 2, " + FACE PROOF", "")))
+                    Dim maxAllF() As Double = Nothing, maxNodeF() As Integer = Nothing
+                    Dim proofPath As String = outputPath.Replace("_auto.csv", "_faceproof.txt")
+                    If Not FaceStressExtract(results, stepCount, (stressFaceMode = 2), nodeR, nodeY, proofPath, _
+                                             maxAllF, vmMaxTop, vmMaxBot, maxNodeF, faceTopByStep, faceBotByStep, faceProvenance) Then
+                        Log("  *** FACE-RESOLVED STRESS FAILED — no one-face fallback (stress_faces.txt mode " & stressFaceMode & "). FAILING run. ***")
+                        Return False
+                    End If
+                    For iStep As Integer = 0 To stepCount - 1
+                        vmMax(iStep) = maxAllF(iStep)
+                        vmMaxNodeID(iStep) = maxNodeF(iStep)
+                        If maxNodeF(iStep) > 0 AndAlso nodeR.ContainsKey(maxNodeF(iStep)) Then
+                            vmMaxR(iStep) = nodeR(maxNodeF(iStep))
+                            vmMaxZ(iStep) = nodeY(maxNodeF(iStep))
+                        End If
+                    Next
+                    stressOK = True
+                    faceResolved = True
+                    Log(String.Format("    Face-resolved: step1={0:F3} MPa  midstep={1:F3} MPa  laststep={2:F3} MPa (top {3:F3} / bottom {4:F3})", _
+                        vmMax(0), vmMax(stepCount \ 2), vmMax(stepCount - 1), vmMaxTop(stepCount - 1), vmMaxBot(stepCount - 1)))
+                Else
+                    Log("  Phase 4.5: GetMinMaxStress per step (Tier 3) — LEGACY ONE-FACE READOUT (stress_faces.txt = 0); not for landing")
+                End If
 
                 ' One-time slot-order detection: the [0]/[2] slots hold node IDs,
                 ' and we need to know which is the MAX node. Cross-check the slot-[2]
                 ' candidate against the per-node API.
                 Dim maxNodeSlot As Integer = 2  ' default guess: [minNid, minVal, maxNid, maxVal]
+                If stressFaceMode = 0 Then
                 Try
                     Dim sx As Integer = 0
                     Dim oa() As Object = DirectCast( _
@@ -3126,6 +4468,7 @@ Imports SolidWorks.Interop.cosworks
                     Log(String.Format("    Last-step max @ node {0} R={1:F2}mm Z={2:F2}mm", _
                         vmMaxNodeID(stepCount - 1), vmMaxR(stepCount - 1), vmMaxZ(stepCount - 1)))
                 End If
+                End If  ' stressFaceMode = 0 (legacy GetMinMaxStress path)
 
                 ' ─── Phase 5: Write _auto.csv ───────────────────────────────────────
                 Dim sb As New System.Text.StringBuilder()
@@ -3138,6 +4481,7 @@ Imports SolidWorks.Interop.cosworks
                 Next
                 If stressOK Then
                     sb.Append(",vonMises_max_MPa,R_at_max_mm,Z_at_max_mm")
+                    If faceResolved Then sb.Append(",vonMises_top_max_MPa,vonMises_bot_max_MPa")
                 End If
                 sb.AppendLine()
                 sb.AppendLine(String.Format("# ID={0} OD={1} N={2} H_pp={3} T={4} E={5} Nu={6} Density={7} Material={8}", _
@@ -3179,7 +4523,11 @@ Imports SolidWorks.Interop.cosworks
                 sb.AppendLine(String.Format("# Crest node Y (mm): " & String.Join(", ", _
                     Array.ConvertAll(crestNodeY, Function(y) y.ToString("F2")))))
                 If stressOK Then
-                    sb.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Tier 3 = per-step global max via GetMinMaxStress)")
+                    If faceResolved Then
+                        sb.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (vonMises_max = per-step max over " & faceProvenance & ")")
+                    Else
+                        sb.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Tier 3 = per-step global max via GetMinMaxStress)")
+                    End If
                 End If
 
                 For iStep As Integer = 0 To stepCount - 1
@@ -3199,6 +4547,9 @@ Imports SolidWorks.Interop.cosworks
                     If stressOK Then
                         Dim vmStr As String = If(Double.IsNaN(vmMax(iStep)), "", vmMax(iStep).ToString("F4"))
                         sb.Append(String.Format(",{0},{1:F4},{2:F4}", vmStr, vmMaxR(iStep), vmMaxZ(iStep)))
+                        If faceResolved Then
+                            sb.Append(String.Format(",{0:F4},{1:F4}", vmMaxTop(iStep), vmMaxBot(iStep)))
+                        End If
                     End If
                     sb.AppendLine()
                 Next
@@ -3275,9 +4626,37 @@ Imports SolidWorks.Interop.cosworks
                         Next
                         Log("  Excursion levels (mm): " & dispLevelsStr)
 
-                        ' Displacement extraction for profile nodes
+                        ' ─────────────────────────────────────────────────────────────
+                        ' PROFILE EXTRACTION — MODE SWITCH (2026-08-30)
+                        ' Post-processing is ~45% of every run: two per-node loops of
+                        ' ~200 COM round trips each, every one returning all 100 steps
+                        ' of which 10 are kept. The bulk path reads the whole shell face
+                        ' set at each of the 10 excursion steps instead: ~20 calls.
+                        '   mode 0 = legacy per-node (default; behaviour unchanged)
+                        '   mode 1 = bulk per-step
+                        '   mode 2 = BOTH, then bit-for-bit diff of every value; legacy
+                        '            values are what gets written. This is the acceptance test.
+                        ' Mode comes from C:\SpiderSW_Results\extract_mode.txt containing 0, 1
+                        ' or 2. File absent or unparseable = 0. Nothing changes unless asked.
+                        ' ─────────────────────────────────────────────────────────────
+                        Dim extractMode As Integer = ReadExtractMode()
+                        Log(String.Format("  Profile extract mode = {0}  (0=per-node legacy, 1=bulk per-step, 2=both + bit-for-bit diff)", extractMode))
+                        Dim needLegacy As Boolean = (extractMode = 0 OrElse extractMode = 2)
+                        Dim needBulk As Boolean = (extractMode = 1 OrElse extractMode = 2)
+
                         Dim profUX(profileNodes.Count - 1, stepCount - 1) As Double
                         Dim profUY(profileNodes.Count - 1, stepCount - 1) As Double
+                        Dim profStress(profileNodes.Count - 1, stepCount - 1) As Double  ' MPa
+                        Dim profStressOK As Boolean = False
+                        ' face-resolved profile stress (mode 1/2): filled from the Phase 4.5
+                        ' per-node dictionaries; the legacy/bulk one-face stress reads are
+                        ' skipped entirely in that mode (displacements unaffected).
+                        Dim profTop(profileNodes.Count - 1, 10) As Double
+                        Dim profBot(profileNodes.Count - 1, 10) As Double
+                        Dim legacyStressWanted As Boolean = stressOK AndAlso (Not faceResolved)
+
+                        If needLegacy Then
+                        ' Displacement extraction for profile nodes
                         For pi As Integer = 0 To profileNodes.Count - 1
                             Dim nid As Integer = profileNodes(pi)
                             Try
@@ -3302,9 +4681,7 @@ Imports SolidWorks.Interop.cosworks
                         Log("  Profile displacement extraction complete")
 
                         ' Tier 1 stress for profile nodes only (per-node API, ~200 calls)
-                        Dim profStress(profileNodes.Count - 1, stepCount - 1) As Double  ' MPa
-                        Dim profStressOK As Boolean = False
-                        If stressOK Then
+                        If legacyStressWanted Then
                             Log(String.Format("  Tier 1: extracting stress for {0} profile nodes...", profileNodes.Count))
                             System.Windows.Forms.Application.DoEvents()  ' flush start message
                             Dim t0 As DateTime = DateTime.Now
@@ -3342,6 +4719,110 @@ Imports SolidWorks.Interop.cosworks
                                 (DateTime.Now - t0).TotalSeconds, sFails))
                             System.Windows.Forms.Application.DoEvents()  ' flush "done" message
                         End If
+                        End If  ' needLegacy
+
+                        ' ---- bulk per-step path ----
+                        Dim bulkUX(profileNodes.Count - 1, 10) As Double
+                        Dim bulkUY(profileNodes.Count - 1, 10) As Double
+                        Dim bulkS(profileNodes.Count - 1, 10) As Double
+                        Dim bulkOK As Boolean = False
+                        Dim bulkStressOK As Boolean = False
+                        If needBulk Then
+                            Dim tb As DateTime = DateTime.Now
+                            bulkOK = BulkProfileExtract(results, profileNodes, profileSteps, legacyStressWanted, bulkUX, bulkUY, bulkS, bulkStressOK)
+                            Log(String.Format("  Bulk profile extract {0} in {1:F1}s  (stress {2})", _
+                                If(bulkOK, "OK", "FAILED"), (DateTime.Now - tb).TotalSeconds, If(bulkStressOK, "OK", "unavailable")))
+                        End If
+
+                        ' ---- acceptance: bit-for-bit comparison, legacy vs bulk (mode 2) ----
+                        If extractMode = 2 Then
+                            If Not bulkOK Then
+                                Log("  ACCEPTANCE: bulk path FAILED — cannot compare. VERDICT: NOT ACCEPTED")
+                            Else
+                                Dim nCmp As Integer = 0
+                                Dim nIdent As Integer = 0
+                                Dim nCmpS As Integer = 0
+                                Dim nIdentS As Integer = 0
+                                Dim maxDX As Double = 0.0
+                                Dim maxDY As Double = 0.0
+                                Dim maxDS As Double = 0.0
+                                For pi As Integer = 0 To profileNodes.Count - 1
+                                    For ti As Integer = 1 To 10
+                                        Dim si As Integer = profileSteps(ti)
+                                        Dim dX As Double = Math.Abs(profUX(pi, si) - bulkUX(pi, ti))
+                                        Dim dY As Double = Math.Abs(profUY(pi, si) - bulkUY(pi, ti))
+                                        nCmp += 2
+                                        If dX = 0.0 Then nIdent += 1
+                                        If dY = 0.0 Then nIdent += 1
+                                        If dX > maxDX Then maxDX = dX
+                                        If dY > maxDY Then maxDY = dY
+                                        If profStressOK AndAlso bulkStressOK Then
+                                            Dim dS As Double = Math.Abs(profStress(pi, si) - bulkS(pi, ti))
+                                            nCmpS += 1
+                                            If dS = 0.0 Then nIdentS += 1
+                                            If dS > maxDS Then maxDS = dS
+                                        End If
+                                    Next
+                                Next
+                                Log(String.Format("  ACCEPTANCE displacement: {0} values compared, {1} bit-identical, max |dUX|={2:E3} mm, max |dUY|={3:E3} mm", nCmp, nIdent, maxDX, maxDY))
+                                If profStressOK AndAlso bulkStressOK Then
+                                    Log(String.Format("  ACCEPTANCE stress:       {0} values compared, {1} bit-identical, max |dS|={2:E3} MPa", nCmpS, nIdentS, maxDS))
+                                Else
+                                    Log("  ACCEPTANCE stress:       not compared (legacy or bulk stress unavailable)")
+                                End If
+                                Dim identical As Boolean = (nIdent = nCmp) AndAlso ((Not profStressOK) OrElse (Not bulkStressOK) OrElse (nIdentS = nCmpS))
+                                Log("  ACCEPTANCE VERDICT: " & If(identical, "BIT-FOR-BIT IDENTICAL — bulk path ACCEPTED", "DIFFERENCES FOUND — bulk path NOT ACCEPTED"))
+                            End If
+                            ' mode 2 always writes the legacy values below
+                        End If
+
+                        ' ---- mode 1: bulk values feed the writer ----
+                        If extractMode = 1 Then
+                            If Not bulkOK Then
+                                Log("  *** bulk profile extract FAILED in mode 1 — no profile written. FAILING run. ***")
+                                Return False
+                            End If
+                            For pi As Integer = 0 To profileNodes.Count - 1
+                                For ti As Integer = 1 To 10
+                                    Dim si As Integer = profileSteps(ti)
+                                    profUX(pi, si) = bulkUX(pi, ti)
+                                    profUY(pi, si) = bulkUY(pi, ti)
+                                    profStress(pi, si) = bulkS(pi, ti)
+                                Next
+                            Next
+                            profStressOK = bulkStressOK
+                        End If
+
+                        ' ---- face-resolved stress feeds the writer (stress_faces.txt 1/2) ----
+                        If faceResolved Then
+                            Dim missing As Integer = 0
+                            For ti As Integer = 1 To 10
+                                Dim si As Integer = profileSteps(ti)
+                                Dim tM As Dictionary(Of Integer, Double) = Nothing
+                                Dim bM As Dictionary(Of Integer, Double) = Nothing
+                                If Not faceTopByStep.TryGetValue(si, tM) OrElse Not faceBotByStep.TryGetValue(si, bM) Then
+                                    Log(String.Format("  *** FACE: decile step {0} (0-based) has no face-resolved data — step formula mismatch. FAILING run. ***", si))
+                                    Return False
+                                End If
+                                For pi As Integer = 0 To profileNodes.Count - 1
+                                    Dim nid As Integer = profileNodes(pi)
+                                    Dim vT As Double = 0.0, vB As Double = 0.0
+                                    If tM.TryGetValue(nid, vT) AndAlso bM.TryGetValue(nid, vB) Then
+                                        profTop(pi, ti) = vT
+                                        profBot(pi, ti) = vB
+                                        profStress(pi, si) = Math.Max(vT, vB)
+                                    Else
+                                        missing += 1
+                                    End If
+                                Next
+                            Next
+                            If missing > 0 Then
+                                Log(String.Format("  *** FACE: {0} profile node-steps absent from the face-resolved read. FAILING run. ***", missing))
+                                Return False
+                            End If
+                            profStressOK = True
+                            Log(String.Format("  FACE: profile stress filled for {0} nodes x 10 levels (top, bottom, max)", profileNodes.Count))
+                        End If
 
                         ' Build _profile.csv
                         Dim sbProf As New System.Text.StringBuilder()
@@ -3356,6 +4837,16 @@ Imports SolidWorks.Interop.cosworks
                                 Dim dLabel As String = profileDisp(ti).ToString("F1").Replace(".", "_")
                                 sbProf.Append(String.Format(",Stress_at_{0}_MPa", dLabel))
                             Next
+                            If faceResolved Then
+                                For ti As Integer = 1 To 10
+                                    Dim dLabel As String = profileDisp(ti).ToString("F1").Replace(".", "_")
+                                    sbProf.Append(String.Format(",StressTop_at_{0}_MPa", dLabel))
+                                Next
+                                For ti As Integer = 1 To 10
+                                    Dim dLabel As String = profileDisp(ti).ToString("F1").Replace(".", "_")
+                                    sbProf.Append(String.Format(",StressBot_at_{0}_MPa", dLabel))
+                                Next
+                            End If
                         End If
                         sbProf.AppendLine()
 
@@ -3373,7 +4864,11 @@ Imports SolidWorks.Interop.cosworks
                         Next
                         sbProf.AppendLine("# Steps used: " & stepStr)
                         If profStressOK Then
-                            sbProf.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Tier 1)")
+                            If faceResolved Then
+                                sbProf.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Stress_at = max of StressTop/StressBot; " & faceProvenance & ")")
+                            Else
+                                sbProf.AppendLine("# Stress component: von Mises (comp=9)  Units: MPa  (Tier 1)")
+                            End If
                         End If
 
                         For pi As Integer = 0 To profileNodes.Count - 1
@@ -3393,6 +4888,14 @@ Imports SolidWorks.Interop.cosworks
                                     Dim si As Integer = profileSteps(ti)
                                     sbProf.Append(String.Format(",{0:F4}", profStress(pi, si)))
                                 Next
+                                If faceResolved Then
+                                    For ti As Integer = 1 To 10
+                                        sbProf.Append(String.Format(",{0:F4}", profTop(pi, ti)))
+                                    Next
+                                    For ti As Integer = 1 To 10
+                                        sbProf.Append(String.Format(",{0:F4}", profBot(pi, ti)))
+                                    Next
+                                End If
                             End If
                             sbProf.AppendLine()
                         Next

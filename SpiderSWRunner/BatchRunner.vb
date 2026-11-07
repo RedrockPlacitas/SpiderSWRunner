@@ -71,7 +71,8 @@ Public Class BatchRunner
     End Function
 
     Public Shared Function BuildOutputFilename(ByVal p As SpiderProfile, _
-                                               ByVal isPull As Boolean) As String
+                                               ByVal isPull As Boolean, _
+                                               Optional ByVal innerBC As String = "free") As String
         Dim modeStr As String = If(p.ComponentMode = 1, "Edge", "Spider")
         Dim tag As String = ProfileTag(p)
         Dim matTag As String = p.MaterialName.Replace(" ", "_")
@@ -108,6 +109,10 @@ Public Class BatchRunner
         If Not p.FirstRollUp Then
             base = base & "_FD"
         End If
+        ' INNER BC SUFFIX (2026-08-30): a clamped-boundary run must never share a stem
+        ' with its free-boundary twin of identical geometry. Free adds nothing, so every
+        ' existing stem is unchanged.
+        If String.Equals(innerBC, "clamped", StringComparison.OrdinalIgnoreCase) Then base = base & "_BCclamped"
         If isPull Then
             base = base & "_Pull"
         Else
@@ -135,6 +140,12 @@ Public Class BatchRunner
             r.PrecheckNote = ""
             Dim p As SpiderProfile = r.ToProfile()
 
+            ' InnerBC must be exactly "clamped" or "free" (2026-09-26 input rule)
+            If r.InnerBC <> "clamped" AndAlso r.InnerBC <> "free" Then
+                r.PrecheckPass = False
+                r.PrecheckNote = "InnerBC '" & r.InnerBC & "' is not clamped/free"
+            End If
+
             ' Geometry values for the precheck table
             Try
                 r.EffPitch = p.EffPitchPerRoll
@@ -154,37 +165,23 @@ Public Class BatchRunner
                 End If
             End If
 
-            ' Gate: thin-shell validity — T must stay small vs crest radius.
-            ' Above T/R_crest ~0.13 the shell degrades on the corrugation
-            ' apex and collapses toward flat-plate response (angle/profile-
-            ' independent, non-monotonic in T). The defect is proven on the
-            ' T axis (T>=0.6). R_crest also shrinks with SLen and span, so
-            ' T0.42 SL/size-ladder rows can reach T/R up to ~0.17 while still
-            ' being the trusted corpus — the degradation is only demonstrated
-            ' for thick walls, not that geometry axis. So gate fires only
-            ' where BOTH T/R > 0.13 AND T > 0.43: catches the thick-T garbage,
-            ' never blocks a T0.42 corpus row. (Whether high-T/R T0.42 SL/size
-            ' cells are also degraded is a separate, unproven question.)
-            ' Only guards ArcLines/SineLines shell runs.
-            ' Gate applies to SHELL runs only. Solid runs (SolidMesh=True) are
-            ' the intended path for high T/R and must pass at any ratio.
-            If r.PrecheckPass AndAlso r.ComponentMode = 0 AndAlso Not p.SolidMesh Then
-                Dim rc As Double = p.CrestRadius
-                If rc > 0 AndAlso rc < Double.MaxValue Then
-                    Dim tr As Double = p.T / rc
-                    If tr > 0.13 AndAlso p.T > 0.43 Then
-                        If r.AllowHighTR Then
-                            ' Diagnostic bypass (2026-08-23). The row still runs, but it is
-                            ' quarantine-on-arrival: shell validity at the crest is NOT
-                            ' established here and the result must never reach the store.
-                            r.PrecheckNote = String.Format("*** QUARANTINE *** shell gate BYPASSED by AllowHighTR: T/R_crest {0:F3} > 0.13 at T={1:F2}, R_crest={2:F2}. Diagnostic only - DO NOT INGEST.", tr, p.T, rc)
-                        Else
-                            r.PrecheckPass = False
-                            r.PrecheckNote = String.Format("T/R_crest {0:F3} > 0.13 at T={1:F2} (shell invalid at crest; solid-mesh needed) R_crest={2:F2}", tr, p.T, rc)
-                        End If
-                    End If
-                End If
-            End If
+            ' Gate: thin-shell validity — REMOVED 2026-08-28.
+            '
+            ' The T/R_crest > 0.13 AND T > 0.43 gate is void. It was written
+            ' during the defective reaction-extraction window and no proof of
+            ' the underlying shell degradation was ever recorded. The 148-run
+            ' re-derivation batch was run against it, and the MeshScale
+            ' 0.50 vs 0.25 discriminator at ArcLines A90 / T1.10 / N7
+            ' (T/R_crest = 0.3400) shifted Kms0 by only +1.74% (21.4127 ->
+            ' 21.7861 N/mm), with end-of-stroke force shifting +0.92%. A
+            ' mesh-refinement shift that small is convergence, not shell
+            ' breakdown, so no boundary exists on this axis. SpeaD ruled the
+            ' gate void and ingested the 148 runs as good data.
+            '
+            ' The AllowHighTR column is retained in SweepMatrix/SpiderProfile
+            ' so existing batch CSVs still parse, but it is now inert: no code
+            ' path reads it. Do not reinstate a T/R gate without recorded
+            ' evidence of the defect it is meant to catch.
 
             ' Gate: Bullet parameter validation
             If r.PrecheckPass AndAlso r.ProfileType = 12 Then
@@ -196,7 +193,7 @@ Public Class BatchRunner
             End If
 
             ' Filename collision
-            Dim fname As String = BuildOutputFilename(p, r.IsPull())
+            Dim fname As String = BuildOutputFilename(p, r.IsPull(), r.InnerBC)
             r.OutputFile = System.IO.Path.Combine(r.OutputDir, fname)
             If r.PrecheckPass Then
                 If namesSeen.ContainsKey(r.OutputFile) Then
@@ -219,6 +216,151 @@ Public Class BatchRunner
         Next
         Log(String.Format("══ PRECHECK {0} ══", If(allPass, "PASS — batch may run", "FAILED — fix flagged rows first")))
         Return allPass
+    End Function
+
+
+    ' ──────────────────────────────────────────────────────────────
+    ' RUN-LIST INPUT GUARD (2026-09-26, SD rule after proof row b2).
+    ' The loader (SweepMatrix) splits on commas without honouring quotes
+    ' and defaults any field it cannot parse. A Message text with a comma
+    ' therefore shifted every later column by one and the row ran with
+    ' InnerBC read as "False" (free inner boundary) while reporting PASS.
+    ' This guard re-reads the RAW run-table file the batch was loaded from
+    ' and REFUSES the whole batch — no SolidWorks connection, no solve —
+    ' when any data line is not exactly 34 plain comma-separated fields,
+    ' when any quote character is present, when InnerBC is not exactly
+    ' "clamped" or "free", when ComponentMode is not 0/1, Direction is not
+    ' Push/Pull, a boolean column is not True/False, or a numeric column
+    ' does not parse. It also checks that the parsed rows agree with the
+    ' raw file (count, RunID, InnerBC) so a loader default cannot slip
+    ' through. The reason goes to the BatchLog and to every row's Message.
+    ' ──────────────────────────────────────────────────────────────
+    Private Shared ReadOnly RunListColumns() As String = { _
+        "RunID", "Status", "ComponentMode", "ID", "OD", "N", "H_pp", "T", "LipWidth", "InnerLipWidth", _
+        "FirstRollUp", "ProfileType", "ConnAngle", "SLen", "CenterFlat", "BulletR_Top", "BulletCx", _
+        "TaperPct", "VariablePitch", "PitchTaperPct", "UseNaturalH", "Material", "E", "Nu", "Density", _
+        "MaxDisp", "Steps", "Direction", "OutputDir", "Message", "SolidMesh", "MeshScale", "AllowHighTR", "InnerBC"}
+    Private Shared ReadOnly RunListNumeric() As String = { _
+        "RunID", "ComponentMode", "ID", "OD", "N", "H_pp", "T", "LipWidth", "InnerLipWidth", "ProfileType", _
+        "ConnAngle", "SLen", "CenterFlat", "BulletR_Top", "BulletCx", "TaperPct", "PitchTaperPct", _
+        "E", "Nu", "Density", "MaxDisp", "Steps", "MeshScale"}
+    Private Shared ReadOnly RunListBoolean() As String = { _
+        "FirstRollUp", "VariablePitch", "UseNaturalH", "SolidMesh", "AllowHighTR"}
+
+    ' Returns "" when the file passes; otherwise the first reason it fails.
+    Public Shared Function GuardRunListFile(ByVal path As String, ByVal rows As List(Of BatchRow)) As String
+        Try
+            If String.IsNullOrEmpty(path) Then Return "run-table path not set — raw file cannot be verified"
+            If Not System.IO.File.Exists(path) Then Return "run-table file not found: " & path
+            Dim lines() As String = System.IO.File.ReadAllLines(path)
+            Dim dataLines As New List(Of String)()
+            Dim header As String = ""
+            For Each ln As String In lines
+                If ln.Trim().Length = 0 Then Continue For
+                If header.Length = 0 Then header = ln Else dataLines.Add(ln)
+            Next
+            If header.Length = 0 Then Return "run-table file is empty"
+            Dim hdr() As String = header.Split(","c)
+            If hdr.Length <> RunListColumns.Length Then
+                Return String.Format("header has {0} columns, expected {1}", hdr.Length, RunListColumns.Length)
+            End If
+            For c As Integer = 0 To RunListColumns.Length - 1
+                If hdr(c).Trim() <> RunListColumns(c) Then
+                    Return String.Format("header column {0} is '{1}', expected '{2}'", c + 1, hdr(c).Trim(), RunListColumns(c))
+                End If
+            Next
+            If dataLines.Count <> rows.Count Then
+                Return String.Format("raw file has {0} data lines but {1} rows were loaded", dataLines.Count, rows.Count)
+            End If
+            Dim colIndex As New Dictionary(Of String, Integer)()
+            For c As Integer = 0 To RunListColumns.Length - 1
+                colIndex(RunListColumns(c)) = c
+            Next
+            For li As Integer = 0 To dataLines.Count - 1
+                Dim ln As String = dataLines(li)
+                Dim lineNo As Integer = li + 2
+                If ln.IndexOf(""""c) >= 0 Then
+                    Return String.Format("line {0}: quote character present — a field contains a comma or quote; the loader does not honour quoting", lineNo)
+                End If
+                Dim f() As String = ln.Split(","c)
+                If f.Length <> RunListColumns.Length Then
+                    Return String.Format("line {0}: {1} fields, expected {2}", lineNo, f.Length, RunListColumns.Length)
+                End If
+                For Each nc As String In RunListNumeric
+                    Dim v As Double
+                    If Not Double.TryParse(f(colIndex(nc)).Trim(), Globalization.NumberStyles.Float, Globalization.CultureInfo.InvariantCulture, v) Then
+                        Return String.Format("line {0}: column {1} = '{2}' is not numeric", lineNo, nc, f(colIndex(nc)).Trim())
+                    End If
+                Next
+                For Each bc As String In RunListBoolean
+                    Dim bv As String = f(colIndex(bc)).Trim()
+                    If bv <> "True" AndAlso bv <> "False" Then
+                        Return String.Format("line {0}: column {1} = '{2}' is not True/False", lineNo, bc, bv)
+                    End If
+                Next
+                Dim cm As String = f(colIndex("ComponentMode")).Trim()
+                If cm <> "0" AndAlso cm <> "1" Then Return String.Format("line {0}: ComponentMode = '{1}', expected 0 or 1", lineNo, cm)
+                Dim dr As String = f(colIndex("Direction")).Trim()
+                If dr <> "Push" AndAlso dr <> "Pull" Then Return String.Format("line {0}: Direction = '{1}', expected Push or Pull", lineNo, dr)
+                Dim bc34 As String = f(colIndex("InnerBC")).Trim()
+                If bc34 <> "clamped" AndAlso bc34 <> "free" Then Return String.Format("line {0}: InnerBC = '{1}', expected exactly clamped or free", lineNo, bc34)
+                If RowStressMode(f(colIndex("Message"))) < 0 Then Return String.Format("line {0}: Message carries both FACEPROOF and LEGACYSTRESS", lineNo)
+                If f(colIndex("OutputDir")).Trim().Length = 0 Then Return String.Format("line {0}: OutputDir is empty", lineNo)
+                ' parsed row must agree with the raw line
+                Dim r As BatchRow = rows(li)
+                Dim rawRunID As Integer = CInt(Double.Parse(f(colIndex("RunID")).Trim(), Globalization.CultureInfo.InvariantCulture))
+                If r.RunID <> rawRunID Then Return String.Format("line {0}: loaded RunID {1} != raw RunID {2}", lineNo, r.RunID, rawRunID)
+                If String.Compare(r.InnerBC, bc34, False) <> 0 Then
+                    Return String.Format("line {0}: loaded InnerBC '{1}' != raw InnerBC '{2}'", lineNo, r.InnerBC, bc34)
+                End If
+                If String.Compare(r.OutputDir.Trim(), f(colIndex("OutputDir")).Trim(), False) <> 0 Then
+                    Return String.Format("line {0}: loaded OutputDir differs from raw OutputDir", lineNo)
+                End If
+            Next
+            Return ""
+        Catch ex As System.Exception
+            Return "guard exception: " & ex.Message
+        End Try
+    End Function
+
+    ' ──────────────────────────────────────────────────────────────
+    ' RUN-LIST CONTROLS THE SWITCH FILES (2026-09-27, Patrick: "you give me a
+    ' file, I run it, I give you results" — no hand-edited switch files).
+    ' The run list's Message column may carry these exact tokens:
+    '   FACEPROOF     -> stress readout mode 2 (face-resolved + _faceproof.txt)
+    '   LEGACYSTRESS  -> stress readout mode 0 (legacy one-face, not for landing)
+    '   (neither)     -> mode 1 (face-resolved) — the normal campaign mode
+    '   KEEPOPEN      -> leave SolidWorks open after the batch
+    ' Before each row the batch engine WRITES C:\SpiderSW_Results\stress_faces.txt
+    ' with that row's mode, and at batch start creates or deletes
+    ' C:\SpiderSW_Results\keep_study_open.txt. SWAutomation reads those files
+    ' exactly as before, so the extraction path is unchanged; what was a manual
+    ' step is now driven by the run list. A row carrying both FACEPROOF and
+    ' LEGACYSTRESS is refused by the input guard.
+    ' ──────────────────────────────────────────────────────────────
+    Public Const StressFacesPath As String = "C:\SpiderSW_Results\stress_faces.txt"
+    Public Const KeepOpenPath As String = "C:\SpiderSW_Results\keep_study_open.txt"
+
+    Private Shared Function HasToken(ByVal msg As String, ByVal token As String) As Boolean
+        If String.IsNullOrEmpty(msg) Then Return False
+        For Each w As String In msg.Split(New Char() {" "c, ";"c, "|"c, "["c, "]"c, "("c, ")"c}, StringSplitOptions.RemoveEmptyEntries)
+            If String.Equals(w, token, StringComparison.Ordinal) Then Return True
+        Next
+        Return False
+    End Function
+
+    ' Returns 0, 1 or 2; -1 when the Message asks for two modes at once.
+    Public Shared Function RowStressMode(ByVal msg As String) As Integer
+        Dim proof As Boolean = HasToken(msg, "FACEPROOF")
+        Dim legacy As Boolean = HasToken(msg, "LEGACYSTRESS")
+        If proof AndAlso legacy Then Return -1
+        If proof Then Return 2
+        If legacy Then Return 0
+        Return 1
+    End Function
+
+    Public Shared Function RowKeepOpen(ByVal msg As String) As Boolean
+        Return HasToken(msg, "KEEPOPEN")
     End Function
 
     ' ──────────────────────────────────────────────────────────────
@@ -246,6 +388,50 @@ Public Class BatchRunner
 
         BatchLog(batchLogPath, "BATCH START " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") & _
                  "  rows=" & rows.Count)
+
+        ' INPUT GUARD — refuse the batch before SolidWorks is touched.
+        Dim guardReason As String = GuardRunListFile(checkpointPath, rows)
+        If guardReason.Length > 0 Then
+            Dim msg As String = "INPUT GUARD REFUSED: " & guardReason
+            Log("*** " & msg & " ***")
+            Log("*** Batch NOT started. Fix the run list and reload it. ***")
+            BatchLog(batchLogPath, msg)
+            BatchLog(batchLogPath, "BATCH REFUSED " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") & "  pass=0")
+            For Each r As BatchRow In rows
+                If r.Status <> "PASS" AndAlso r.Status <> "PARTIAL" Then
+                    r.Status = "FAIL"
+                    r.Message = msg
+                End If
+            Next
+            Checkpoint(rows, checkpointPath)
+            Return 0
+        End If
+        Log("Input guard: run list verified (" & rows.Count & " rows, 34 plain fields each, InnerBC/booleans/numerics parsed)")
+        BatchLog(batchLogPath, "Input guard PASS: " & rows.Count & " rows verified against " & checkpointPath)
+
+        ' Switch files from the run list (captured now, before any Message is
+        ' overwritten by a row result).
+        Dim rowMode As New Dictionary(Of Integer, Integer)()
+        Dim keepOpen As Boolean = False
+        For Each r As BatchRow In rows
+            rowMode(r.RunID) = RowStressMode(r.Message)
+            If RowKeepOpen(r.Message) Then keepOpen = True
+        Next
+        Try
+            If keepOpen Then
+                System.IO.File.WriteAllText(KeepOpenPath, "set by run list " & checkpointPath)
+            ElseIf System.IO.File.Exists(KeepOpenPath) Then
+                System.IO.File.Delete(KeepOpenPath)
+            End If
+            Log("Run-list switches: keep_study_open = " & If(keepOpen, "ON", "off"))
+            BatchLog(batchLogPath, "Run-list switches: keep_study_open = " & If(keepOpen, "ON", "off"))
+        Catch exK As System.Exception
+            Dim msgK As String = "INPUT GUARD REFUSED: cannot set " & KeepOpenPath & " (" & exK.Message & ")"
+            Log("*** " & msgK & " ***")
+            BatchLog(batchLogPath, msgK)
+            BatchLog(batchLogPath, "BATCH REFUSED " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") & "  pass=0")
+            Return 0
+        End Try
 
         If Not _sw.ConnectOrStart() Then
             Log("ABORT: cannot connect/start SolidWorks.")
@@ -298,7 +484,21 @@ Public Class BatchRunner
             Dim ok As Boolean = True
             Dim failStage As String = ""
 
+            ' Stress readout mode for THIS row, from the run list (see RowStressMode).
+            Dim sMode As Integer = 1
+            If rowMode.ContainsKey(r.RunID) Then sMode = rowMode(r.RunID)
+            Try
+                System.IO.File.WriteAllText(StressFacesPath, sMode.ToString())
+                Log(String.Format("Run {0}: stress readout mode {1} set from run list ({2})", r.RunID, sMode, _
+                    If(sMode = 2, "FACEPROOF", If(sMode = 0, "LEGACYSTRESS", "face-resolved"))))
+            Catch exS As System.Exception
+                ok = False : failStage = "StressModeFile"
+                Log(String.Format("Run {0}: cannot write {1}: {2}", r.RunID, StressFacesPath, exS.Message))
+            End Try
+
             If ok AndAlso Not _sw.CreatePart(p) Then ok = False : failStage = "CreatePart"
+            _sw.InnerBoundaryClamped = (r.InnerBC = "clamped")
+            _sw.WFreeGateFailed = False
             If ok AndAlso Not _sw.SetupStudy(p, r.MaxDisp, r.Steps, r.IsPull()) Then ok = False : failStage = "SetupStudy"
             If ok AndAlso Not _sw.MeshAndRun() Then ok = False : failStage = "MeshAndRun"
             If ok Then
@@ -345,6 +545,15 @@ Public Class BatchRunner
                 System.IO.Path.GetFileName(r.OutputFile)))
             runsSinceRestart += 1
             Checkpoint(rows, checkpointPath)
+
+            ' W_FREE GATE ABORT (2026-09-03, SD one-BC-standard ruling): the row above
+            ' already FAILED because its emitted W_free was not ActiveW. Stop the batch
+            ' here so a mis-bound family costs minutes, not a night.
+            If _sw.WFreeGateFailed Then
+                BatchLog(batchLogPath, "BATCH ABORTED: W_free gate failed on RunID " & r.RunID & " — remaining rows skipped")
+                Log("*** BATCH ABORTED: W_free gate failed on RunID " & r.RunID & ". Remaining rows skipped. Send the log to SW. ***")
+                Exit For
+            End If
 
             ' First-run verification gate
             If Not firstVerified Then
@@ -476,13 +685,35 @@ Public Class BatchRunner
             End If
 
             ' ── Check 2: Crest |Y| vs nominal H_eff ──
+            ' TOLERANCE 2026-09-15 (SD ruling): the physical quantity is NODE SPACING, not
+            ' millimetres. The extractor reports the nearest mesh node to each crest, so a
+            ' node can sit up to half an element from the apex in R, and its Y is the
+            ' profile evaluated there - not the apex value. Element size is not in the auto
+            ' header, so it is estimated from the row's own data: the crest-R sampling
+            ' offset (target crest R vs reported node R) is at most half an element, so
+            ' elSize ~= 2 x max offset and 0.5 x elSize = that max offset. Floor at the old
+            ' 0.05 so a fine mesh cannot loosen the gate. A natH/H_pp mismatch is 0.5mm+
+            ' and still fails. PERMANENT FIX (next build, SD): evaluate the profile function
+            ' at each node's actual R and compare there, then this returns to a flat 0.05.
             Dim gotY As List(Of Double) = ParseNumList(crestYLine)
+            Dim gotRc As List(Of Double) = ParseNumList(crestRLine)
+            Dim expRc As List(Of Double) = p.GetRollCrestRadii()
+            Dim crestTol As Double = CrestY_Tol_mm
+            If gotRc.Count > 0 AndAlso gotRc.Count = expRc.Count Then
+                Dim maxOff As Double = 0.0
+                For ri As Integer = 0 To gotRc.Count - 1
+                    Dim off As Double = Math.Abs(gotRc(ri) - expRc(ri))
+                    If off > maxOff Then maxOff = off
+                Next
+                If maxOff > crestTol Then crestTol = maxOff
+            End If
             Dim uniformH As Boolean = (p.TaperPct = 0.0 AndAlso Not p.UseNaturalH)
             Dim H_eff As Double = p.H_pp / 2.0
             If uniformH Then
+                sb.Append(String.Format("[2]tol={0:F3}mm ", crestTol))
                 For ci As Integer = 0 To gotY.Count - 1
                     Dim d As Double = Math.Abs(Math.Abs(gotY(ci)) - H_eff)
-                    If d > CrestY_Tol_mm Then
+                    If d > crestTol Then
                         pass = False
                         sb.Append(String.Format("[2]roll{0} |Y|={1:F3} vs Heff={2:F3} ", _
                             ci + 1, Math.Abs(gotY(ci)), H_eff))
